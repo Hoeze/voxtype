@@ -1688,6 +1688,41 @@ The Soniox backend pulls in a small WebSocket client (tokio-tungstenite + rustls
 
 ---
 
+## [openvino]
+
+Configuration for the OpenVINO Whisper speech-to-text engine. This section is only used when `engine = "openvino"`. It requires a build with `--features openvino-whisper` and an installed OpenVINO Runtime.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `model` | String | `"base.en"` | Model name or path to an OpenVINO IR model directory |
+| `device` | String | `"NPU"` | OpenVINO device: `"NPU"`, `"CPU"`, `"GPU"`, or `"AUTO"` |
+| `quantized` | Boolean | `true` | Prefer int8 quantized model variants |
+| `threads` | Integer | system-detected | CPU inference threads |
+| `language` | String | `"en"` | Whisper language code |
+| `translate` | Boolean | `false` | Translate non-English speech to English |
+| `on_demand_loading` | Boolean | `false` | Load the model when recording begins |
+
+The model directory must contain the OpenVINO encoder and decoder XML/BIN files plus `tokenizer.json`. Available bundled short names include `"base.en-int8"`, `"base.en-fp16"`, `"small.en-int8"`, `"base-int8"`, and `"large-v3-int8"`.
+
+```toml
+engine = "openvino"
+
+[openvino]
+model = "base.en-int8"
+device = "NPU"
+quantized = true
+language = "en"
+on_demand_loading = false
+```
+
+Build from source with:
+
+```bash
+cargo build --release --features openvino-whisper
+```
+
+---
+
 ## [output]
 
 Controls how transcribed text is delivered.
