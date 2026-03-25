@@ -1704,6 +1704,22 @@ Configuration for the OpenVINO Whisper speech-to-text engine. This section is on
 
 The model directory must contain the OpenVINO encoder and decoder XML/BIN files plus `tokenizer.json`. Available bundled short names include `"base.en-int8"`, `"base.en-fp16"`, `"small.en-int8"`, `"base-int8"`, and `"large-v3-int8"`.
 
+### openvino.openvino_dir
+
+**Type:** String (optional)
+**Default:** None (automatic discovery)
+**Environment variable:** `VOXTYPE_OPENVINO_DIR`
+
+Path to the OpenVINO installation directory containing shared libraries. When set, voxtype loads `libopenvino_genai_c.so` from this directory instead of relying on automatic discovery via `LD_LIBRARY_PATH`, `OPENVINO_INSTALL_DIR`, or system package paths.
+
+The library is searched in these subdirectories:
+- `<openvino_dir>/`
+- `<openvino_dir>/runtime/lib/intel64/`
+- `<openvino_dir>/runtime/lib/intel64/Release/`
+
+This is useful when you have a custom OpenVINO build or an installation in a non-standard location (e.g., a pip install or a manual extract).
+
+**Example:**
 ```toml
 engine = "openvino"
 
@@ -1713,6 +1729,7 @@ device = "NPU"
 quantized = true
 language = "en"
 on_demand_loading = false
+openvino_dir = "/opt/intel/openvino"
 ```
 
 Build from source with:
