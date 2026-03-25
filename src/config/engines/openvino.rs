@@ -9,6 +9,8 @@ use super::super::{default_on_demand_loading, default_true};
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OpenVinoConfig {
     /// Model name or path to a directory containing OpenVINO IR model files.
+    /// Quantized names include "base.en-int8", "small.en-fp16", and "tiny-int4".
+    /// Short names such as "base.en" use `quantized` to select int8 or fp16.
     pub model: String,
 
     /// OpenVINO inference device: "NPU", "CPU", "GPU", or "AUTO".
