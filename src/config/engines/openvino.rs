@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use super::super::{default_on_demand_loading, default_true};
 
-/// OpenVINO Whisper speech-to-text configuration (Intel NPU/CPU/GPU).
+/// OpenVINO Whisper speech-to-text configuration (Intel NPU/CPU/GPU via OpenVINO GenAI).
 /// Requires: cargo build --features openvino-whisper
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OpenVinoConfig {
@@ -34,6 +34,11 @@ pub struct OpenVinoConfig {
     /// Load the model when recording starts instead of at daemon startup.
     #[serde(default = "default_on_demand_loading")]
     pub on_demand_loading: bool,
+
+    /// OpenVINO installation directory containing the GenAI shared library.
+    /// Also settable through VOXTYPE_OPENVINO_DIR.
+    #[serde(default)]
+    pub openvino_dir: Option<String>,
 }
 
 fn default_openvino_device() -> String {
@@ -54,6 +59,7 @@ impl Default for OpenVinoConfig {
             language: default_openvino_language(),
             translate: false,
             on_demand_loading: false,
+            openvino_dir: None,
         }
     }
 }
