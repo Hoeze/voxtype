@@ -25,14 +25,13 @@ pub mod worker;
 
 pub use streaming::{SegmentId, StreamHandle, StreamingEvent, StreamingTranscriber};
 
-/// Shared log-mel filterbank feature extraction for ONNX-based and OpenVINO ASR engines
+/// Shared log-mel filterbank feature extraction for ONNX-based ASR engines
 #[cfg(any(
     feature = "sensevoice",
     feature = "paraformer",
     feature = "dolphin",
     feature = "omnilingual",
     feature = "cohere",
-    feature = "openvino-whisper",
 ))]
 pub mod fbank;
 
