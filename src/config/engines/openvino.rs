@@ -37,7 +37,7 @@ pub struct OpenVinoConfig {
     #[serde(default = "default_on_demand_loading")]
     pub on_demand_loading: bool,
 
-    /// OpenVINO installation directory containing the GenAI shared library.
+    /// OpenVINO GenAI installation directory containing the shared library.
     /// Also settable through VOXTYPE_OPENVINO_DIR.
     #[serde(default)]
     pub openvino_dir: Option<String>,

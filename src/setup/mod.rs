@@ -1101,18 +1101,19 @@ pub async fn run_checks(config: &Config) -> anyhow::Result<()> {
             if path.is_dir() {
                 let name = entry.file_name().to_string_lossy().to_string();
                 if name.starts_with("openvino-whisper")
-                    && model::validate_openvino_model(&path).is_ok() {
-                        let size = std::fs::read_dir(&path)
-                            .map(|entries| {
-                                entries
-                                    .flatten()
-                                    .filter_map(|e| e.metadata().ok())
-                                    .map(|m| m.len())
-                                    .sum()
-                            })
-                            .unwrap_or(0);
-                        openvino_models.push((name, size));
-                    }
+                    && model::validate_openvino_model(&path).is_ok()
+                {
+                    let size = std::fs::read_dir(&path)
+                        .map(|entries| {
+                            entries
+                                .flatten()
+                                .filter_map(|e| e.metadata().ok())
+                                .map(|m| m.len())
+                                .sum()
+                        })
+                        .unwrap_or(0);
+                    openvino_models.push((name, size));
+                }
             }
         }
     }
