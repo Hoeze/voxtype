@@ -1655,14 +1655,14 @@ The model directory must contain the OpenVINO encoder and decoder XML/BIN files 
 **Default:** None (automatic discovery)
 **Environment variable:** `VOXTYPE_OPENVINO_DIR`
 
-Path to the OpenVINO installation directory containing shared libraries. When set, voxtype loads `libopenvino_genai_c.so` from this directory instead of relying on automatic discovery via `LD_LIBRARY_PATH`, `OPENVINO_INSTALL_DIR`, or system package paths.
+Path to the OpenVINO GenAI installation directory containing shared libraries. When set, voxtype loads `libopenvino_genai_c.so` from this directory instead of relying on automatic discovery via `LD_LIBRARY_PATH`, `OPENVINO_INSTALL_DIR`, or system package paths.
 
 The library is searched in these subdirectories:
 - `<openvino_dir>/`
 - `<openvino_dir>/runtime/lib/intel64/`
 - `<openvino_dir>/runtime/lib/intel64/Release/`
 
-This is useful when you have a custom OpenVINO build or an installation in a non-standard location (e.g., a pip install or a manual extract).
+This is useful when you have a custom OpenVINO build or an installation in a non-standard location (for example, a `pip install openvino-genai` environment or a manual extract).
 
 **Example:**
 ```toml

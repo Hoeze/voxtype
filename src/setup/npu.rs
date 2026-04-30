@@ -95,7 +95,7 @@ pub fn show_status() {
     } else {
         super::print_failure("openvino-whisper feature not compiled");
         super::print_info(
-            "Install voxtype-openvino package or rebuild with --features openvino-whisper",
+            "Install a build with openvino-whisper enabled, or rebuild with --features openvino-whisper",
         );
     }
 
@@ -140,7 +140,7 @@ pub fn enable() -> anyhow::Result<()> {
     {
         anyhow::bail!(
             "NPU support requires the openvino-whisper feature.\n\
-             Install the voxtype-openvino package, or rebuild with:\n  \
+             Install a build with openvino-whisper enabled, or rebuild with:\n  \
              cargo build --features openvino-whisper"
         );
     }
