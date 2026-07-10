@@ -24,6 +24,8 @@ pub mod cgevent;
 pub mod clipboard;
 pub mod dotool;
 pub mod eitype;
+#[cfg(all(feature = "portal", not(target_os = "macos")))]
+pub mod portal;
 // modifier_guard is evdev-based; macOS has its own osascript modifier handling.
 #[cfg(target_os = "linux")]
 pub mod modifier_guard;
@@ -275,6 +277,14 @@ fn create_driver_output(
             config.eitype_xkb_layout.clone(),
             config.eitype_xkb_variant.clone(),
         )),
+        #[cfg(feature = "portal")]
+        OutputDriver::Portal => Box::new(portal::PortalOutput::new(
+            config.auto_submit,
+            config.append_text.clone(),
+            config.type_delay_ms,
+            pre_type_delay_ms,
+            config.shift_enter_newlines,
+        )),
         OutputDriver::Dotool => Box::new(dotool::DotoolOutput::new(
             config.type_delay_ms,
             pre_type_delay_ms,
@@ -455,7 +465,8 @@ pub struct OutputOptions<'a> {
 /// keybindings when modifiers are held. Used to filter the chain when the
 /// modifier-release wait times out.
 fn is_keystroke_method(name: &str) -> bool {
-    matches!(name, "wtype" | "eitype" | "dotool" | "ydotool") || name.starts_with("paste")
+    matches!(name, "wtype" | "eitype" | "dotool" | "ydotool" | "portal")
+        || name.starts_with("paste")
 }
 
 /// Try each output method in the chain until one succeeds
