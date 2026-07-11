@@ -4,13 +4,14 @@
 //!
 //! Fallback chain for `mode = "type"`:
 //!
-//! Linux:
-//! 1. wtype - Wayland-native via virtual-keyboard protocol, best Unicode/CJK support, no daemon needed
-//! 2. eitype - Wayland via libei/EI protocol, works on GNOME/KDE (no virtual-keyboard support)
-//! 3. dotool - Works on X11/Wayland/TTY, supports keyboard layouts, no daemon needed
-//! 4. ydotool - Works on X11/Wayland/TTY, requires daemon
-//! 5. clipboard (wl-copy) - Wayland clipboard fallback
-//! 6. xclip - X11 clipboard fallback
+//! Linux (portal is tried first when built with the default `portal` feature):
+//! 1. portal - persistent XDG RemoteDesktop session, works on KDE/GNOME/wlroots, no uinput
+//! 2. wtype - Wayland-native via virtual-keyboard protocol, best Unicode/CJK support, no daemon needed
+//! 3. eitype - Wayland via libei/EI protocol, works on GNOME/KDE (no virtual-keyboard support)
+//! 4. dotool - Works on X11/Wayland/TTY, supports keyboard layouts, no daemon needed
+//! 5. ydotool - Works on X11/Wayland/TTY, requires daemon
+//! 6. clipboard (wl-copy) - Wayland clipboard fallback
+//! 7. xclip - X11 clipboard fallback
 //!
 //! macOS:
 //! 1. cgevent - Native CGEvent API for keyboard simulation (best performance)
@@ -241,8 +242,23 @@ pub trait TextOutput: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
-/// Default driver order for type mode
-#[cfg(not(target_os = "macos"))]
+/// Default driver order for type mode. With the `portal` feature (enabled by
+/// default), the persistent RemoteDesktop portal driver is tried first: it
+/// works on KDE/GNOME/wlroots without uinput and supersedes wtype where the
+/// portal is available.
+#[cfg(all(feature = "portal", not(target_os = "macos")))]
+const DEFAULT_DRIVER_ORDER: &[OutputDriver] = &[
+    OutputDriver::Portal,
+    OutputDriver::Wtype,
+    OutputDriver::Eitype,
+    OutputDriver::Dotool,
+    OutputDriver::Ydotool,
+    OutputDriver::Clipboard,
+    OutputDriver::Xclip,
+];
+
+/// Default driver order for type mode (built without the `portal` feature).
+#[cfg(all(not(feature = "portal"), not(target_os = "macos")))]
 const DEFAULT_DRIVER_ORDER: &[OutputDriver] = &[
     OutputDriver::Wtype,
     OutputDriver::Eitype,
