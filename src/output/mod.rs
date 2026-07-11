@@ -4,7 +4,7 @@
 //!
 //! Fallback chain for `mode = "type"`:
 //!
-//! Linux (portal is tried first when built with the default `portal` feature):
+//! Linux:
 //! 1. portal - persistent XDG RemoteDesktop session, works on KDE/GNOME/wlroots, no uinput
 //! 2. wtype - Wayland-native via virtual-keyboard protocol, best Unicode/CJK support, no daemon needed
 //! 3. eitype - Wayland via libei/EI protocol, works on GNOME/KDE (no virtual-keyboard support)
