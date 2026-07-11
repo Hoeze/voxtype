@@ -266,6 +266,22 @@ async fn tap(rd: &Proxy<'_>, session: &ObjectPath<'_>, keysym: i32) -> Result<()
     notify(rd, session, keysym, KEY_RELEASED).await
 }
 
+/// Probe whether the RemoteDesktop portal is present and offers keyboard
+/// input, WITHOUT creating a session (no consent dialog). Used by the driver's
+/// availability check and by `voxtype setup` status.
+pub async fn probe_available() -> bool {
+    let Ok(conn) = Connection::session().await else {
+        return false;
+    };
+    let Ok(rd) = Proxy::new(&conn, PORTAL_DEST, PORTAL_PATH, RD_IFACE).await else {
+        return false;
+    };
+    matches!(
+        rd.get_property::<u32>("AvailableDeviceTypes").await,
+        Ok(types) if types & DEVICE_KEYBOARD != 0
+    )
+}
+
 /// Portal-based text output holding one persistent RemoteDesktop session.
 pub struct PortalOutput {
     auto_submit: bool,
@@ -403,19 +419,7 @@ impl TextOutput for PortalOutput {
         if session_cell().lock().await.is_some() {
             return true;
         }
-        // Probe WITHOUT creating a session, so answering availability never
-        // pops a consent dialog: connect and read the AvailableDeviceTypes
-        // property, checking the keyboard bit.
-        let Ok(conn) = Connection::session().await else {
-            return false;
-        };
-        let Ok(rd) = Proxy::new(&conn, PORTAL_DEST, PORTAL_PATH, RD_IFACE).await else {
-            return false;
-        };
-        matches!(
-            rd.get_property::<u32>("AvailableDeviceTypes").await,
-            Ok(types) if types & DEVICE_KEYBOARD != 0
-        )
+        probe_available().await
     }
 
     fn name(&self) -> &'static str {
