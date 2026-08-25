@@ -41,6 +41,60 @@ pub struct OpenVinoConfig {
     /// Also settable through VOXTYPE_OPENVINO_DIR.
     #[serde(default)]
     pub openvino_dir: Option<String>,
+
+    // --- Sliding-window streaming settings (same knobs as [whisper]) ---
+    /// Enable live streaming transcription via the shared sliding-window engine.
+    #[serde(default)]
+    pub streaming: bool,
+
+    /// Seconds between re-transcriptions of the rolling buffer.
+    #[serde(default = "default_streaming_interval_secs")]
+    pub streaming_interval_secs: f32,
+
+    /// Maximum buffered audio (seconds) before the window slides.
+    #[serde(default = "default_streaming_max_buffer_secs")]
+    pub streaming_max_buffer_secs: f32,
+
+    /// Skip transcription while whole-buffer RMS is below this.
+    #[serde(default = "default_streaming_min_speech_rms")]
+    pub streaming_min_speech_rms: f32,
+
+    /// Minimum buffered audio (seconds) before the first partial is attempted.
+    #[serde(default = "default_streaming_min_audio_secs")]
+    pub streaming_min_audio_secs: f32,
+
+    /// Minimum number of new stable words before a delta is committed/typed.
+    #[serde(default = "default_streaming_partial_min_words")]
+    pub streaming_partial_min_words: usize,
+
+    /// Type committed deltas live at the cursor (`true`) or commit whole
+    /// segments at once (`false`).
+    #[serde(default = "default_streaming_type_partials")]
+    pub streaming_type_partials: bool,
+}
+
+fn default_streaming_interval_secs() -> f32 {
+    0.8
+}
+
+fn default_streaming_max_buffer_secs() -> f32 {
+    29.0
+}
+
+fn default_streaming_min_speech_rms() -> f32 {
+    0.005
+}
+
+fn default_streaming_min_audio_secs() -> f32 {
+    1.0
+}
+
+fn default_streaming_partial_min_words() -> usize {
+    1
+}
+
+fn default_streaming_type_partials() -> bool {
+    true
 }
 
 fn default_openvino_device() -> String {
@@ -62,6 +116,13 @@ impl Default for OpenVinoConfig {
             translate: false,
             on_demand_loading: false,
             openvino_dir: None,
+            streaming: false,
+            streaming_interval_secs: default_streaming_interval_secs(),
+            streaming_max_buffer_secs: default_streaming_max_buffer_secs(),
+            streaming_min_speech_rms: default_streaming_min_speech_rms(),
+            streaming_min_audio_secs: default_streaming_min_audio_secs(),
+            streaming_partial_min_words: default_streaming_partial_min_words(),
+            streaming_type_partials: default_streaming_type_partials(),
         }
     }
 }

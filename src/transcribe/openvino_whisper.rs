@@ -15,6 +15,17 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+/// Directory OpenVINO persists compiled device blobs to (`CACHE_DIR`
+/// property), so NPU/GPU graph compilation isn't repeated on every pipeline
+/// init. Same `$XDG_CACHE_HOME/voxtype/<name>` convention as the MIGraphX
+/// model cache in `setup/binary.rs`.
+fn openvino_cache_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("voxtype")
+        .join("openvino")
+}
+
 /// OpenVINO GenAI Whisper transcriber for Intel NPU/CPU/GPU.
 ///
 /// Pipeline creation is deferred to `prepare()` (called when recording starts),
@@ -131,14 +142,47 @@ impl OpenVinoTranscriber {
             TranscribeError::InitFailed("Model path contains invalid UTF-8".to_string())
         })?;
 
-        let pipeline = WhisperPipeline::new(model_path_str, &config.device).map_err(|e| {
-            TranscribeError::InitFailed(format!(
-                "Failed to create OpenVINO GenAI Whisper pipeline for {}: {}\n\n{}",
-                config.device,
-                e,
-                config.installation_guidance(),
-            ))
-        })?;
+        // CACHE_DIR persists the device's compiled model blob to disk so
+        // subsequent pipeline inits skip recompilation. This matters most
+        // on NPU (compiling the graph to NPU-ISA) and GPU (OpenCL kernel
+        // compilation) — both are expensive on cold start and otherwise pay
+        // that cost on every daemon restart. CPU accepts the property too
+        // but has little to gain from it (its compile step is cheap).
+        let cache_dir = openvino_cache_dir();
+        let cache_dir_str = cache_dir.to_string_lossy();
+        let props: &[(&str, &str)] = &[("CACHE_DIR", &cache_dir_str)];
+
+        let pipeline = match WhisperPipeline::with_properties(model_path_str, &config.device, props)
+        {
+            Ok(p) => p,
+            // Fall back to CPU on a device init failure (missing driver,
+            // no NPU on this chip, ...) rather than failing outright —
+            // CPU is always available. Only when the configured device
+            // isn't already CPU, and only report the CPU error if that
+            // fallback also fails.
+            Err(e) if !config.device.eq_ignore_ascii_case("CPU") => {
+                tracing::warn!(
+                    "OpenVINO device '{}' failed to initialize ({}); falling back to CPU",
+                    config.device,
+                    e
+                );
+                WhisperPipeline::with_properties(model_path_str, "CPU", props).map_err(|e2| {
+                    TranscribeError::InitFailed(format!(
+                        "OpenVINO pipeline init failed on CPU: {}\n\n{}",
+                        e2,
+                        config.installation_guidance(),
+                    ))
+                })?
+            }
+            Err(e) => {
+                return Err(TranscribeError::InitFailed(format!(
+                    "Failed to create OpenVINO GenAI Whisper pipeline for {}: {}\n\n{}",
+                    config.device,
+                    e,
+                    config.installation_guidance(),
+                )))
+            }
+        };
         tracing::info!(
             "OpenVINO GenAI Whisper pipeline created in {:.2}s (device={})",
             start.elapsed().as_secs_f32(),

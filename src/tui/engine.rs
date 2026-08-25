@@ -256,6 +256,10 @@ const LANG_CHOICES: &[&str] = &[
 ];
 const SV_LANG_CHOICES: &[&str] = &["auto", "zh", "en", "ja", "ko", "yue"];
 const PARAKEET_MODEL_TYPES: &[Option<&str>] = &[None, Some("tdt"), Some("ctc")];
+/// Inference device OpenVINO GenAI tries first; falls back to CPU if the
+/// requested device fails to initialize (see `OpenVinoTranscriber::new`).
+/// AUTO is a real OpenVINO device value too (see `installation_guidance`'s
+/// own AUTO arm) — included here so it's reachable from the picker.
 const OV_DEVICE_CHOICES: &[&str] = &["NPU", "GPU", "CPU", "AUTO"];
 
 fn rows_for_engine_with_mode(engine: &str, whisper_mode: &str) -> Vec<FieldId> {
@@ -480,6 +484,22 @@ impl EngineState {
         self.binary_switch_blocked = None;
 
         let inv = binary::inventory();
+
+        // OpenVINO isn't part of the prebuilt binary distribution: no
+        // Whisper or ONNX variant links against openvino-genai (it's an
+        // entirely separate Intel runtime, not an ONNX execution provider),
+        // so there's no variant to switch to. It's purely a source-build
+        // Cargo feature; just check whether the running binary has it.
+        if self.engine == "openvino" {
+            if !inv.compiled_features.contains(&"openvino") {
+                self.binary_switch_blocked = Some(
+                    "OpenVINO isn't available in prebuilt voxtype binaries. \
+                     Build from source with --features openvino.",
+                );
+            }
+            return;
+        }
+
         if inv.install_kind == InstallKind::Source {
             // Source builds can't be hot-swapped; whether the running binary
             // supports the chosen engine depends on its compiled features.
@@ -1002,6 +1022,10 @@ fn installed_engine_choices() -> std::collections::HashSet<&'static str> {
             "dolphin",
             "omnilingual",
             "cohere",
+            // OpenVINO isn't checked against `variant.supports_engine()`
+            // above — it has no prebuilt binary variant at all (Intel-only
+            // runtime, unrelated to the Whisper/ONNX distribution). Source
+            // builds with the feature compiled in are the only way it runs.
             "openvino",
         ] {
             if *f == engine {
@@ -1015,7 +1039,10 @@ fn installed_engine_choices() -> std::collections::HashSet<&'static str> {
 
 /// Resolve where on disk a model directory lives. Mirrors the daemon's
 /// resolution path so the TUI's "is this downloaded?" check matches what
-/// the daemon will look for at load time.
+/// the daemon will look for at load time. OpenVINO model directories are
+/// looked up by name via `model::openvino_dir_name` (see
+/// `setup::model::download_openvino_model`, which downloads to the same
+/// flat `models_dir/<dir_name>` layout every other engine uses).
 fn model_dir_on_disk(engine: &str, name: &str) -> std::path::PathBuf {
     let models_dir = crate::config::Config::models_dir();
     if engine == "openvino" {
