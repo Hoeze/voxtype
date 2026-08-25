@@ -3171,11 +3171,16 @@ fn update_config_openvino(model_name: &str) -> anyhow::Result<()> {
         if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)?;
             let updated = update_openvino_in_config(&content, model_name);
-            std::fs::write(&config_path, updated)?;
+            std::fs::write(&config_path, &updated)?;
             print_success(&format!(
                 "Config updated: engine = \"openvino\", model = \"{}\"",
                 model_name
             ));
+            let device = toml::from_str::<Config>(&updated)
+                .ok()
+                .and_then(|config| config.openvino.map(|openvino| openvino.device))
+                .unwrap_or_else(|| "NPU".to_string());
+            print_openvino_installation_guidance(&device);
         } else {
             print_info("No config file found. Run 'voxtype setup' first.");
         }
@@ -3183,6 +3188,15 @@ fn update_config_openvino(model_name: &str) -> anyhow::Result<()> {
     } else {
         anyhow::bail!("Could not determine config path")
     }
+}
+
+/// Print the runtime and driver requirements for a configured OpenVINO device.
+pub fn print_openvino_installation_guidance(device: &str) {
+    let config = crate::config::OpenVinoConfig {
+        device: device.to_string(),
+        ..crate::config::OpenVinoConfig::default()
+    };
+    println!("\n{}", config.installation_guidance());
 }
 
 /// Generic handler for ONNX engine model selection (download/config/restart).

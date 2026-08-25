@@ -79,7 +79,13 @@ impl OpenVinoTranscriber {
     /// Load the OpenVINO GenAI shared library, using a custom path if configured.
     fn load_library(config: &OpenVinoConfig) -> Result<(), TranscribeError> {
         if let Some(ref dir) = config.openvino_dir {
-            let lib_path = find_genai_library(dir)?;
+            let lib_path = find_genai_library(dir).map_err(|error| {
+                TranscribeError::InitFailed(format!(
+                    "{}\n\n{}",
+                    error,
+                    config.installation_guidance()
+                ))
+            })?;
             // Preload OpenVINO dependency libraries with RTLD_GLOBAL so that dlopen
             // can resolve the DT_NEEDED entries in libopenvino_genai_c.so. The OpenVINO
             // shared libraries don't set RPATH/RUNPATH, and glibc caches LD_LIBRARY_PATH
@@ -94,18 +100,19 @@ impl OpenVinoTranscriber {
             openvino_genai::load_from(&lib_path).map_err(|e| {
                 TranscribeError::InitFailed(format!(
                     "Failed to load OpenVINO GenAI library from {}: {}\n  \
-                     Ensure libopenvino_genai_c.so exists in the specified openvino_dir.",
+                     Ensure libopenvino_genai_c.so exists in the specified openvino_dir.\n\n{}",
                     lib_path.display(),
-                    e
+                    e,
+                    config.installation_guidance(),
                 ))
             })
         } else {
             openvino_genai::load().map_err(|e| {
                 TranscribeError::InitFailed(format!(
                     "Failed to load OpenVINO GenAI library: {}\n  \
-                     Install OpenVINO GenAI: pip install openvino-genai\n  \
-                     Or set openvino_dir in [openvino] config to the library directory.",
-                    e
+                     Automatic discovery did not find libopenvino_genai_c.so.\n\n{}",
+                    e,
+                    config.installation_guidance(),
                 ))
             })
         }
@@ -124,23 +131,13 @@ impl OpenVinoTranscriber {
             TranscribeError::InitFailed("Model path contains invalid UTF-8".to_string())
         })?;
 
-        let is_npu = config.device.to_uppercase() == "NPU";
-
         let pipeline = WhisperPipeline::new(model_path_str, &config.device).map_err(|e| {
-            if is_npu {
-                TranscribeError::InitFailed(format!(
-                    "Failed to create OpenVINO GenAI Whisper pipeline for NPU: {}\n  \
-                     Ensure intel-npu-driver is installed.\n  \
-                     Check: ls /dev/accel/accel*\n  \
-                     Or set device = \"CPU\" in [openvino] config.",
-                    e
-                ))
-            } else {
-                TranscribeError::InitFailed(format!(
-                    "Failed to create OpenVINO GenAI Whisper pipeline for {}: {}",
-                    config.device, e
-                ))
-            }
+            TranscribeError::InitFailed(format!(
+                "Failed to create OpenVINO GenAI Whisper pipeline for {}: {}\n\n{}",
+                config.device,
+                e,
+                config.installation_guidance(),
+            ))
         })?;
         tracing::info!(
             "OpenVINO GenAI Whisper pipeline created in {:.2}s (device={})",
@@ -574,6 +571,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn missing_runtime_error_has_configured_device_guidance() {
+        let config = OpenVinoConfig {
+            device: "GPU".to_string(),
+            openvino_dir: Some("/definitely/not/an/openvino/sdk".to_string()),
+            ..OpenVinoConfig::default()
+        };
+
+        let error = OpenVinoTranscriber::load_library(&config)
+            .expect_err("a nonexistent SDK path must fail")
+            .to_string();
+        assert!(error.contains("libopenvino_genai_c.so"));
+        assert!(error.contains("openvino-intel-gpu-plugin"));
+        assert!(error.contains("intel-compute-runtime"));
+        assert!(!error.contains("intel-npu-driver"));
     }
 
     /// Real-life integration test: loads a WAV file and transcribes with OpenVINO GenAI.

@@ -620,6 +620,12 @@ pub async fn run_setup(
                         "Config updated: engine = \"openvino\", model = \"{}\"",
                         model_name
                     ));
+                    let device = config
+                        .openvino
+                        .as_ref()
+                        .map(|openvino| openvino.device.as_str())
+                        .unwrap_or("NPU");
+                    model::print_openvino_installation_guidance(device);
                 }
             } else if download {
                 model::download_openvino_model(model_name)?;
@@ -630,6 +636,12 @@ pub async fn run_setup(
                         "Config updated: engine = \"openvino\", model = \"{}\"",
                         model_name
                     ));
+                    let device = config
+                        .openvino
+                        .as_ref()
+                        .map(|openvino| openvino.device.as_str())
+                        .unwrap_or("NPU");
+                    model::print_openvino_installation_guidance(device);
                 }
             } else if !quiet {
                 print_info(&format!("Model '{}' not downloaded yet", model_name));

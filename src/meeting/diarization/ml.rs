@@ -306,8 +306,7 @@ impl MlDiarizer {
         }
     }
 
-    /// Convert samples window to milliseconds
-    #[cfg(feature = "ml-diarization")]
+    #[cfg(all(test, feature = "ml-diarization"))]
     fn samples_to_ms(&self, samples: usize) -> u64 {
         (samples as u64 * 1000) / self.sample_rate as u64
     }
@@ -322,14 +321,14 @@ impl Default for MlDiarizer {
 impl Diarizer for MlDiarizer {
     fn diarize(
         &self,
-        _samples: &[f32],
+        samples: &[f32],
         _source: AudioSource,
         transcript_segments: &[TranscriptSegment],
     ) -> Vec<DiarizedSegment> {
         // If model is not loaded or feature is disabled, fall back to simple attribution
         #[cfg(not(feature = "ml-diarization"))]
         {
-            let _ = _samples;
+            let _ = samples;
             transcript_segments
                 .iter()
                 .map(|seg| DiarizedSegment {

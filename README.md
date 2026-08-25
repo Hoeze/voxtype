@@ -442,8 +442,10 @@ Intel NPU acceleration uses OpenVINO GenAI with Whisper models exported in OpenV
 # Build with OpenVINO support
 cargo build --release --features openvino-whisper
 
-# Install OpenVINO GenAI runtime libraries (required at runtime)
-pip install openvino-genai
+# Arch Linux: install the core runtime plus the plugin/driver for your device
+sudo pacman -S openvino openvino-intel-npu-plugin intel-npu-driver        # NPU
+# sudo pacman -S openvino openvino-intel-gpu-plugin level-zero-loader intel-compute-runtime  # GPU
+# sudo pacman -S openvino                                                  # CPU
 
 # Download a model
 voxtype setup model  # Select an OpenVINO model
@@ -458,7 +460,17 @@ device = "NPU"
 EOF
 ```
 
-The NPU requires the Intel NPU driver (`intel-npu-driver`). Set `device = "CPU"` to fall back to CPU inference on systems without an NPU.
+Every device also requires `libopenvino_genai_c.so` from Intel's
+[version-matched OpenVINO GenAI C/C++ SDK archive](https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/).
+The `openvino-genai` pip wheel and `openvino-genai-bin` package do not ship this
+C API library. Extract the SDK and set `openvino_dir` to its root (or add
+`runtime/lib/intel64` to `LD_LIBRARY_PATH`). The OpenVINO-enabled release binary
+loads this runtime only when `engine = "openvino"`, so other engines do not
+require any OpenVINO packages.
+
+The NPU driver requires a reboot; verify it with `ls /dev/accel/accel*`. For an
+Intel GPU, verify a render node with `ls /dev/dri/renderD*`. Set `device = "CPU"`
+for CPU-only inference, which needs no device-specific driver.
 
 ### Performance Comparison
 
