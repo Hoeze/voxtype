@@ -152,6 +152,16 @@ impl Config {
                 .as_ref()
                 .map(|s| s.streaming && !s.async_api)
                 .unwrap_or(false),
+            // Same reasoning as Parakeet/Soniox: an absent [openvino] section
+            // means the transcriber can't initialize anyway, so don't
+            // auto-promote push-to-talk to toggle for a config that can't
+            // run. Missing this arm previously left recording permanently
+            // stuck open on the first real NPU/GPU streaming session, since
+            // typing at the cursor while a key is physically held clobbers
+            // libinput's held-key tracking on Hyprland/Sway/River.
+            TranscriptionEngine::OpenVino => {
+                self.openvino.as_ref().map(|o| o.streaming).unwrap_or(false)
+            }
             _ => false,
         }
     }
