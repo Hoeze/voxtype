@@ -1690,7 +1690,7 @@ The Soniox backend pulls in a small WebSocket client (tokio-tungstenite + rustls
 
 ## [openvino]
 
-Configuration for the OpenVINO Whisper speech-to-text engine. This section is only used when `engine = "openvino"`. It requires a build with `--features openvino-whisper` and an installed OpenVINO Runtime.
+Configuration for the OpenVINO Whisper speech-to-text engine. This section is only used when `engine = "openvino"`. The x86_64 ONNX release binaries include the feature, and source builds can enable it with `--features openvino-whisper`. OpenVINO is loaded at runtime only when this engine is selected, so a missing runtime does not affect other engines.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
@@ -1717,7 +1717,28 @@ The library is searched in these subdirectories:
 - `<openvino_dir>/runtime/lib/intel64/`
 - `<openvino_dir>/runtime/lib/intel64/Release/`
 
-This is useful when you have a custom OpenVINO build or an installation in a non-standard location (for example, a `pip install openvino-genai` environment or a manual extract).
+This is useful when you have a custom OpenVINO build or Intel's SDK archive extracted in a non-standard location.
+
+### Runtime and device packages
+
+All devices require the core OpenVINO runtime and `libopenvino_genai_c.so` from
+Intel's [version-matched OpenVINO GenAI C/C++ SDK archive](https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/).
+Match the SDK version to the installed core OpenVINO version, extract it, then
+set `openvino_dir` to the extracted root or add its `runtime/lib/intel64`
+directory to `LD_LIBRARY_PATH`.
+
+The `openvino-genai` pip wheel and Arch's `openvino-genai-bin` package do not
+provide `libopenvino_genai_c.so`; installing either one alone is insufficient
+for the Rust/C API used by voxtype.
+
+On Arch Linux, install only the device packages you need:
+
+| Configured device | Packages | Verification |
+|-------------------|----------|--------------|
+| `NPU` | `openvino openvino-intel-npu-plugin intel-npu-driver` | Reboot, then `ls /dev/accel/accel*` |
+| `GPU` | `openvino openvino-intel-gpu-plugin level-zero-loader intel-compute-runtime` | `ls /dev/dri/renderD*` |
+| `CPU` | `openvino` | No device-specific driver required |
+| `AUTO` | `openvino` plus each NPU/GPU plugin and driver that AUTO may use | Verify each enabled device as above |
 
 **Example:**
 ```toml

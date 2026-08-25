@@ -180,6 +180,7 @@ pub fn enable() -> anyhow::Result<()> {
         // Update config to use OpenVINO engine
         super::model::set_openvino_config(DEFAULT_OPENVINO_MODEL)?;
         super::print_success("Config updated: engine = \"openvino\"");
+        super::model::print_openvino_installation_guidance("NPU");
 
         println!();
         println!("NPU acceleration enabled (OpenVINO engine).");
