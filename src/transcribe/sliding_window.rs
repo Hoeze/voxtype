@@ -44,6 +44,39 @@
 //! per-word (or per-stable-run) instead of on the whole remaining delta;
 //! that's a real design change, not a quick patch, and hasn't been done.
 //!
+//! ## Revision mode (experimental, `revision_mode` config flag)
+//!
+//! An alternative to the conservative gate above, opt-in and off by
+//! default. Instead of withholding the whole unconfirmed tail until it's
+//! stable, revision mode types the current best-guess tail immediately as
+//! `provisional_words` and reconciles it every tick against the freshly
+//! re-transcribed one:
+//!
+//! - If the fresh tail still agrees with everything currently displayed,
+//!   whatever's new beyond it is appended (a plain `Partial`/`Final`, same
+//!   as today).
+//! - If the fresh tail disagrees partway through what's displayed, the
+//!   wrong suffix is backspaced (character-exact, accounting for the
+//!   inter-word space) and the corrected text retyped — a
+//!   [`StreamingEvent::Replace`], the same mechanism Soniox already uses
+//!   for punctuation-flip revisions.
+//! - A word only stays revisable for `REVISION_LAG_WORDS` ticks' worth of
+//!   further growth behind it; once that much newer content has appeared,
+//!   it's promoted into permanently-confirmed text (folded into
+//!   `full_text_parts`) and will never be revised again, bounding how far
+//!   back a correction can ever reach.
+//!
+//! This trades the "occasionally pauses, never wrong" property of the
+//! default gate for "more responsive, occasionally visibly
+//! backspaces-and-retypes." That's a materially different (and riskier)
+//! failure mode for the live-typing case specifically: a wrong backspace
+//! count doesn't just look bad, it can delete characters that were never
+//! ours to begin with if bookkeeping ever drifts (moved focus, a backend
+//! with no backspace primitive, ...) — see `replace_and_commit`'s own
+//! defensive handling of that in `output/streaming.rs`. File-output
+//! sessions have no such risk (`replace_and_commit_silent` just edits an
+//! in-memory string), which is the safer place to try this first.
+//!
 //! ## Event mapping
 //!
 //! Each committed delta is emitted as a [`StreamingEvent::Partial`] (typed
@@ -91,6 +124,56 @@ const HALLUCINATION_PATTERNS: &[&str] = &[
 /// Below this we skip transcription entirely (prevents hallucination).
 const MIN_SPEECH_RMS: f32 = 0.005;
 
+/// Revision mode only: how many trailing words of the provisional tail
+/// stay eligible for correction. Once more than this many words of fresh
+/// content have appeared behind a word, it's promoted to permanently
+/// confirmed text and can never be revised again — this bounds how far
+/// back (in words, and therefore in backspaced characters) any single
+/// correction can ever reach.
+const REVISION_LAG_WORDS: usize = 4;
+
+/// One committed change to the streamed output, produced by a tick or by
+/// `final_flush`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Delta {
+    /// Append `text` after whatever's already been typed. Maps to a plain
+    /// `Partial`/`Final` event depending on `type_partials` — the only
+    /// kind of delta the non-revision-mode gate ever produces.
+    Append(String),
+    /// Revision mode only: backspace `backspace` (Unicode scalar) chars,
+    /// then type `text`. Maps to `StreamingEvent::Replace`.
+    Replace { backspace: usize, text: String },
+}
+
+/// Map a [`Delta`] to the [`StreamingEvent`] the daemon expects. `Append`
+/// becomes a `Partial` (typed live) or commit-only `Final` depending on
+/// `type_partials`, matching the non-revision-mode behavior exactly.
+/// `Replace` always maps to `StreamingEvent::Replace` regardless of
+/// `type_partials` — it's a correction to already-displayed text, not a
+/// progressive-typing choice, so there's no "non-partial" equivalent.
+fn delta_to_event(delta: Delta, type_partials: bool) -> StreamingEvent {
+    match delta {
+        Delta::Append(text) => {
+            if type_partials {
+                StreamingEvent::Partial {
+                    text,
+                    segment_id: 0,
+                }
+            } else {
+                StreamingEvent::Final {
+                    text,
+                    segment_id: 0,
+                }
+            }
+        }
+        Delta::Replace { backspace, text } => StreamingEvent::Replace {
+            backspace,
+            text,
+            segment_id: 0,
+        },
+    }
+}
+
 /// Tuning knobs for the sliding-window engine. Defaults mirror nova-npu.
 #[derive(Debug, Clone, Copy)]
 pub struct SlidingWindowConfig {
@@ -110,6 +193,14 @@ pub struct SlidingWindowConfig {
     /// Emit committed deltas as `Partial` (typed live at the cursor) when
     /// true; emit them as commit-only `Final` segments when false.
     pub type_partials: bool,
+    /// Experimental: type the current best-guess tail immediately and
+    /// correct it later via backspace + retype (`StreamingEvent::Replace`)
+    /// if a following tick disagrees, instead of withholding it until two
+    /// consecutive ticks agree. More responsive; can visibly flicker (type
+    /// then backspace then retype) when Whisper changes its mind about a
+    /// word. See the module doc's "Revision mode" section. Default false
+    /// keeps the conservative wait-for-agreement behavior.
+    pub revision_mode: bool,
 }
 
 impl Default for SlidingWindowConfig {
@@ -122,6 +213,7 @@ impl Default for SlidingWindowConfig {
             min_audio_s: 1.0,
             partial_min_words: 2,
             type_partials: true,
+            revision_mode: false,
         }
     }
 }
@@ -203,10 +295,8 @@ impl StreamingTranscriber for SlidingWindowStreamingTranscriber {
                     Outcome::Eof => {
                         // Graceful end: one last flush so no audio is lost.
                         if let Some(tail) = session.final_flush() {
-                            let _ = runtime.block_on(events_tx.send(StreamingEvent::Final {
-                                text: tail,
-                                segment_id: 0,
-                            }));
+                            let event = delta_to_event(tail, config.type_partials);
+                            let _ = runtime.block_on(events_tx.send(event));
                         }
                         let _ = runtime.block_on(events_tx.send(StreamingEvent::Ended));
                         return Ok(());
@@ -214,17 +304,7 @@ impl StreamingTranscriber for SlidingWindowStreamingTranscriber {
                     Outcome::Tick => match session.on_tick() {
                         Ok(deltas) => {
                             for delta in deltas {
-                                let event = if config.type_partials {
-                                    StreamingEvent::Partial {
-                                        text: delta,
-                                        segment_id: 0,
-                                    }
-                                } else {
-                                    StreamingEvent::Final {
-                                        text: delta,
-                                        segment_id: 0,
-                                    }
-                                };
+                                let event = delta_to_event(delta, config.type_partials);
                                 let _ = runtime.block_on(events_tx.send(event));
                             }
                         }
@@ -280,6 +360,12 @@ struct Session {
     confirmed_words: Vec<String>,
     /// Delta words from the previous pass (sliding mode).
     last_delta_words: Vec<String>,
+
+    /// Revision mode only: the tail currently typed at the cursor but not
+    /// yet permanently confirmed — may still be corrected via a `Replace`
+    /// on a later tick. Empty and unused when `config.revision_mode` is
+    /// false. See the module doc's "Revision mode" section.
+    provisional_words: Vec<String>,
 }
 
 impl Session {
@@ -294,6 +380,7 @@ impl Session {
             last_words: Vec::new(),
             confirmed_words: Vec::new(),
             last_delta_words: Vec::new(),
+            provisional_words: Vec::new(),
         }
     }
 
@@ -355,8 +442,9 @@ impl Session {
     }
 
     /// One interval tick: re-transcribe, diff, and return the newly-committed
-    /// stable deltas (at most one per tick).
-    fn on_tick(&mut self) -> Result<Vec<String>, TranscribeError> {
+    /// deltas (at most one per tick in the conservative gate; revision mode
+    /// also produces at most one, but it may be a correction).
+    fn on_tick(&mut self) -> Result<Vec<Delta>, TranscribeError> {
         let Some(curr) = self.transcribe_buffer()? else {
             return Ok(Vec::new());
         };
@@ -365,6 +453,24 @@ impl Session {
             return Ok(Vec::new());
         }
 
+        let deltas = if self.config.revision_mode {
+            match self.revision_new_tail(&curr) {
+                Some(tail) => self.reconcile_revision(tail).into_iter().collect(),
+                None => Vec::new(),
+            }
+        } else {
+            self.on_tick_conservative(&curr, &curr_words)
+        };
+
+        self.prev_whisper = curr;
+        self.last_words = curr_words;
+        Ok(deltas)
+    }
+
+    /// The default (`revision_mode = false`) commit policy: withhold each
+    /// mode's tail until it's agreed across two consecutive ticks. See the
+    /// module doc's "Commit policy" section.
+    fn on_tick_conservative(&mut self, curr: &str, curr_words: &[String]) -> Vec<Delta> {
         let mut deltas = Vec::new();
 
         if self.sliding {
@@ -380,7 +486,7 @@ impl Session {
             // length-based fallback) risks re-emitting already-committed
             // text as a literal duplicate instead of just being briefly
             // unresponsive.
-            let mut delta = extract_new_text_confident(&already_emitted, &curr).unwrap_or_default();
+            let mut delta = extract_new_text_confident(&already_emitted, curr).unwrap_or_default();
             let mut delta_words: Vec<String> =
                 delta.split_whitespace().map(str::to_owned).collect();
             tracing::trace!(
@@ -406,14 +512,14 @@ impl Session {
                         };
                         tracing::debug!("[sliding] COMMIT (sliding mode): {typed:?}");
                         self.full_text_parts.push(new);
-                        deltas.push(typed);
+                        deltas.push(Delta::Append(typed));
                         // Re-diff so last_delta_words reflects the remaining
                         // unconfirmed words only.
                         let full_emitted = self.full_text_parts.join(" ");
                         let already_emitted =
                             last_n_words(&full_emitted, SLIDING_DIFF_LOOKBACK_WORDS);
                         delta =
-                            extract_new_text_confident(&already_emitted, &curr).unwrap_or_default();
+                            extract_new_text_confident(&already_emitted, curr).unwrap_or_default();
                         delta_words = delta.split_whitespace().map(str::to_owned).collect();
                     } else if !new.is_empty() {
                         tracing::debug!(
@@ -427,7 +533,7 @@ impl Session {
             // Growing buffer: commit the common-prefix words between the
             // previous and current transcriptions, advancing confirmed_words.
             if !self.last_words.is_empty() {
-                let stable_n = common_prefix_len(&self.last_words, &curr_words);
+                let stable_n = common_prefix_len(&self.last_words, curr_words);
                 if stable_n > self.confirmed_words.len() {
                     let confirmed_new = &curr_words[self.confirmed_words.len()..stable_n];
                     if confirmed_new.len() >= self.config.partial_min_words {
@@ -447,25 +553,129 @@ impl Session {
                             tracing::debug!("[sliding] COMMIT (growing mode): {typed:?}");
                             self.full_text_parts.push(new);
                             self.confirmed_words.extend(confirmed_new.iter().cloned());
-                            deltas.push(typed);
+                            deltas.push(Delta::Append(typed));
                         }
                     }
                 }
             }
         }
 
-        self.prev_whisper = curr;
-        self.last_words = curr_words;
-        Ok(deltas)
+        deltas
+    }
+
+    /// Revision mode: this tick's full best-guess of everything beyond
+    /// permanently-confirmed text, or `None` if no confident determination
+    /// could be made this pass (sliding mode only — see
+    /// `extract_new_text_confident`'s doc comment for why guessing here is
+    /// worse than waiting for the next tick). Shared by `on_tick` and
+    /// `final_flush` since both need the same computation, just against a
+    /// different `curr`.
+    fn revision_new_tail(&self, curr: &str) -> Option<Vec<String>> {
+        // Both modes diff against *text*, not a raw word-count index.
+        // Growing mode used to slice `curr_words[confirmed_words.len()..]`
+        // directly, assuming curr_words[..confirmed_words.len()] always
+        // exactly equals confirmed_words — true only as long as Whisper
+        // never rewords anything behind the confirmed boundary on a
+        // later pass. It does: a dropped filler word, a merged
+        // contraction, a punctuation change all shift the position
+        // confirmed_words.len() points to within curr_words, without
+        // changing the actual confirmed *text*. Found live: a session
+        // where this drifted re-typed several already-committed
+        // sentences as if they were new, repeatedly, every time it
+        // recurred — a plain index slice has no way to notice the
+        // words it's grabbing aren't actually new. Diffing against text
+        // (same confident-anchor-only strategy sliding mode already
+        // uses) is immune to this: it verifies the confirmed tail is
+        // still actually present before treating anything past it as new.
+        let confirmed_text = last_n_words(
+            &if self.sliding {
+                self.full_text_parts.join(" ")
+            } else {
+                self.confirmed_words.join(" ")
+            },
+            SLIDING_DIFF_LOOKBACK_WORDS,
+        );
+        extract_new_text_confident(&confirmed_text, curr)
+            .map(|s| s.split_whitespace().map(str::to_owned).collect())
+    }
+
+    /// Revision mode: reconcile `new_tail_words` (this pass's full
+    /// best-guess of everything not yet permanently confirmed) against
+    /// `self.provisional_words` (what's currently displayed but still
+    /// revisable). Returns the single `Delta` needed to bring the cursor's
+    /// visible text in line with `new_tail_words` — a pure append, a
+    /// backspace+retype correction, or `None` if nothing changed — then
+    /// promotes anything more than `REVISION_LAG_WORDS` behind the tail's
+    /// end into `full_text_parts`, where it's confirmed and can never be
+    /// revised again. See the module doc's "Revision mode" section.
+    fn reconcile_revision(&mut self, new_tail_words: Vec<String>) -> Option<Delta> {
+        let agree_n = common_prefix_len(&self.provisional_words, &new_tail_words);
+        // Whether there's confirmed text before the whole provisional
+        // block — only matters when agree_n == 0; typed_len_from/
+        // format_typed already account for agree_n > 0 themselves (an
+        // earlier surviving word is always immediately before the point
+        // of correction/extension in that case).
+        let has_prefix = !self.full_text_parts.is_empty();
+
+        let delta = if agree_n < self.provisional_words.len() {
+            // Divergence: the tail beyond `agree_n` that's currently on
+            // screen is wrong. Backspace it (char-exact, including its own
+            // leading separator) and retype the corrected + extended tail.
+            let backspace = typed_len_from(&self.provisional_words, agree_n, has_prefix);
+            let text = format_typed(&new_tail_words, agree_n, has_prefix);
+            tracing::debug!(
+                "[sliding] REVISE: backspace {backspace} chars, retype {text:?} \
+                 (was {:?})",
+                self.provisional_words
+            );
+            Some(Delta::Replace { backspace, text })
+        } else if agree_n < new_tail_words.len() {
+            // Pure extension: everything already displayed still agrees;
+            // append whatever's new beyond it.
+            let text = format_typed(&new_tail_words, agree_n, has_prefix);
+            if text.is_empty() {
+                None
+            } else {
+                tracing::debug!("[sliding] REVISE append: {text:?}");
+                Some(Delta::Append(text))
+            }
+        } else {
+            None
+        };
+
+        self.provisional_words = new_tail_words;
+
+        // Promote anything more than REVISION_LAG_WORDS behind the tail's
+        // end into permanently-confirmed text. Pure bookkeeping: this
+        // content is already correctly on screen as part of the delta
+        // just computed above, so no additional typing is needed for it.
+        if self.provisional_words.len() > REVISION_LAG_WORDS {
+            let confirm_upto = self.provisional_words.len() - REVISION_LAG_WORDS;
+            let newly_confirmed: Vec<String> =
+                self.provisional_words.drain(..confirm_upto).collect();
+            if !newly_confirmed.is_empty() {
+                self.full_text_parts.push(newly_confirmed.join(" "));
+                self.confirmed_words.extend(newly_confirmed);
+            }
+        }
+
+        delta
     }
 
     /// One last transcription at end-of-recording. Returns the remaining tail
     /// delta (never cumulative text — the daemon already typed the partials).
-    fn final_flush(&mut self) -> Option<String> {
+    fn final_flush(&mut self) -> Option<Delta> {
         let final_text = match self.transcribe_buffer() {
             Ok(Some(t)) => t,
             _ => return None,
         };
+
+        if self.config.revision_mode {
+            return self
+                .revision_new_tail(&final_text)
+                .and_then(|tail| self.reconcile_revision(tail));
+        }
+
         let full_emitted = self.full_text_parts.join(" ");
         let already_emitted = last_n_words(&full_emitted, SLIDING_DIFF_LOOKBACK_WORDS);
         let delta = extract_new_text(&already_emitted, &final_text);
@@ -482,7 +692,7 @@ impl Session {
                 format!(" {delta}")
             };
             self.full_text_parts.push(delta);
-            Some(typed)
+            Some(Delta::Append(typed))
         }
     }
 }
@@ -542,6 +752,41 @@ fn last_n_words(text: &str, n: usize) -> String {
     let words: Vec<&str> = text.split_whitespace().collect();
     let start = words.len().saturating_sub(n);
     words[start..].join(" ")
+}
+
+/// Revision mode: exact character length that would be BACKSPACED to
+/// remove `words[from_idx..]` from the cursor. `has_prefix` is whether
+/// there's content immediately before `words[from_idx]` — either prior
+/// confirmed text or an earlier surviving provisional word — which means
+/// a separating space was typed right before it that also needs removing.
+fn typed_len_from(words: &[String], from_idx: usize, has_prefix: bool) -> usize {
+    if from_idx >= words.len() {
+        return 0;
+    }
+    let tail = words[from_idx..].join(" ");
+    // A leading separating space was typed before `words[from_idx]`
+    // whenever there's anything before it — either an earlier word in
+    // this same array (`from_idx > 0`) or context the caller says exists
+    // before the whole array (`has_prefix`, meaningful only at
+    // `from_idx == 0`).
+    let leading_space = from_idx > 0 || has_prefix;
+    tail.chars().count() + usize::from(leading_space)
+}
+
+/// Revision mode: the exact string that would be TYPED for
+/// `words[from_idx..]`, given `has_prefix` (see `typed_len_from`) — a
+/// leading separating space is prepended whenever there's content before
+/// `words[from_idx]`, by the same rule `typed_len_from` uses.
+fn format_typed(words: &[String], from_idx: usize, has_prefix: bool) -> String {
+    if from_idx >= words.len() {
+        return String::new();
+    }
+    let tail = words[from_idx..].join(" ");
+    if from_idx > 0 || has_prefix {
+        format!(" {tail}")
+    } else {
+        tail
+    }
 }
 
 /// Strip any leading words of `candidate` that restate the tail of
@@ -830,6 +1075,176 @@ mod tests {
         );
     }
 
+    fn words(s: &str) -> Vec<String> {
+        s.split_whitespace().map(str::to_owned).collect()
+    }
+
+    fn revision_session() -> Session {
+        let mut cfg = streaming_config();
+        cfg.revision_mode = true;
+        Session::new(Arc::new(FakeTranscriber), cfg)
+    }
+
+    #[test]
+    fn revision_new_tail_growing_mode_is_immune_to_reworded_prefix_drift() {
+        // Reproduces a real bug found live: growing mode used to slice
+        // curr_words[confirmed_words.len()..] by raw word-count index.
+        // Here Whisper's fresh full-buffer pass rewords the
+        // already-confirmed sentence ("This works way better.") by
+        // hearing one extra word ("much") it missed before, shifting
+        // where the confirmed content actually ends in curr_words by
+        // one position. The old index slice would grab "better." again
+        // alongside the genuinely new tail; the live incident this
+        // reproduces did the same thing at a much larger scale (whole
+        // already-typed sentences retyped, repeatedly).
+        let mut session = revision_session();
+        assert!(
+            !session.sliding,
+            "this scenario is specifically growing mode"
+        );
+        session.confirmed_words = words("This works way better.");
+
+        let curr = "This works way much better. No hang ups.";
+        let tail = session.revision_new_tail(curr).unwrap();
+
+        assert_eq!(
+            tail,
+            words("No hang ups."),
+            "must not re-include any part of the reworded confirmed sentence"
+        );
+    }
+
+    #[test]
+    fn typed_len_from_counts_leading_space_only_when_prefixed() {
+        let w = words("alpha beta gamma");
+        // Removing everything, with something before it (leading space
+        // counts): " alpha beta gamma" = 1 + 16 = 17 chars.
+        assert_eq!(typed_len_from(&w, 0, true), 17);
+        // Removing everything, nothing before it (no leading space to
+        // remove): "alpha beta gamma" = 16 chars.
+        assert_eq!(typed_len_from(&w, 0, false), 16);
+        // Removing from index 1 onward: " beta gamma" (leading space
+        // before "beta" always counts, regardless of has_prefix, since
+        // "alpha" is right before it either way).
+        assert_eq!(typed_len_from(&w, 1, true), 11);
+        assert_eq!(typed_len_from(&w, 1, false), 11);
+        // Nothing left to remove.
+        assert_eq!(typed_len_from(&w, 3, true), 0);
+    }
+
+    #[test]
+    fn format_typed_matches_typed_len_from() {
+        let w = words("alpha beta gamma");
+        assert_eq!(format_typed(&w, 0, true), " alpha beta gamma");
+        assert_eq!(format_typed(&w, 0, false), "alpha beta gamma");
+        assert_eq!(format_typed(&w, 1, true), " beta gamma");
+        // Symmetry: the backspace count always matches the removed
+        // string's exact character length.
+        for (from_idx, has_prefix) in [(0, true), (0, false), (1, true), (2, false)] {
+            let removed = format_typed(&w, from_idx, has_prefix);
+            assert_eq!(
+                typed_len_from(&w, from_idx, has_prefix),
+                removed.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn reconcile_revision_pure_extension_has_zero_backspace() {
+        let mut session = revision_session();
+        // First tick: nothing displayed yet, tail is "hello".
+        let delta = session.reconcile_revision(words("hello"));
+        assert_eq!(delta, Some(Delta::Append("hello".to_string())));
+        assert_eq!(session.provisional_words, words("hello"));
+
+        // Second tick: tail grew to "hello world" — pure extension, no
+        // correction needed.
+        let delta = session.reconcile_revision(words("hello world"));
+        assert_eq!(delta, Some(Delta::Append(" world".to_string())));
+        assert_eq!(session.provisional_words, words("hello world"));
+    }
+
+    #[test]
+    fn reconcile_revision_no_change_emits_nothing() {
+        let mut session = revision_session();
+        session.reconcile_revision(words("hello world"));
+        let delta = session.reconcile_revision(words("hello world"));
+        assert_eq!(delta, None);
+    }
+
+    #[test]
+    fn reconcile_revision_divergence_emits_char_exact_backspace() {
+        let mut session = revision_session();
+        // Displayed: "turn on the lamp" (all still provisional — under
+        // the confirm lag).
+        session.reconcile_revision(words("turn on the lamp"));
+
+        // Whisper changes its mind: "lamp" should have been "light".
+        let delta = session.reconcile_revision(words("turn on the light"));
+        match delta {
+            Some(Delta::Replace { backspace, text }) => {
+                // Only "lamp" (4 chars) plus its leading space needs
+                // removing — "turn on the" survived unchanged and must
+                // NOT be touched.
+                assert_eq!(backspace, " lamp".chars().count());
+                assert_eq!(text, " light");
+            }
+            other => panic!("expected a Replace correction, got {other:?}"),
+        }
+        assert_eq!(session.provisional_words, words("turn on the light"));
+    }
+
+    #[test]
+    fn reconcile_revision_divergence_mid_tail_only_touches_wrong_suffix() {
+        let mut session = revision_session();
+        // 6 words with REVISION_LAG_WORDS=4 immediately confirms the
+        // first 2 ("the", "cat") in this same call — provisional_words is
+        // left as ["sat", "on", "the", "mat"].
+        session.reconcile_revision(words("the cat sat on the mat"));
+        assert_eq!(session.provisional_words, words("sat on the mat"));
+
+        // Next tail must not re-include the now-confirmed "the cat" (real
+        // callers never do — see revision_new_tail). Only "sat on the"
+        // still agrees; "mat" -> "rug" is the actual correction.
+        let delta = session.reconcile_revision(words("sat on the rug"));
+        match delta {
+            Some(Delta::Replace { backspace, text }) => {
+                assert_eq!(backspace, " mat".chars().count());
+                assert_eq!(text, " rug");
+            }
+            other => panic!("expected a Replace correction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reconcile_revision_confirms_behind_the_lag_and_never_revisits_it() {
+        let mut session = revision_session();
+        // Feed one word at a time; once more than REVISION_LAG_WORDS
+        // words of newer content exist, the oldest word(s) must be
+        // promoted into full_text_parts and drop out of provisional_words
+        // — and from then on, even if a *fresh* tail were to "disagree"
+        // with that confirmed word, it's already outside provisional_words
+        // and cannot be reached by any future correction.
+        let sentence = "one two three four five six seven";
+        let all_words = words(sentence);
+        for n in 1..=all_words.len() {
+            // Mirrors what `revision_new_tail` actually computes for
+            // growing mode: only the words beyond what's already
+            // confirmed — never re-passing already-confirmed words, which
+            // would (correctly) look like fresh duplicate content.
+            let confirmed_len = session.confirmed_words.len();
+            session.reconcile_revision(all_words[confirmed_len..n].to_vec());
+        }
+        assert!(session.provisional_words.len() <= REVISION_LAG_WORDS);
+        let confirmed_and_provisional: Vec<String> = session
+            .full_text_parts
+            .iter()
+            .flat_map(|s| s.split_whitespace().map(str::to_owned))
+            .chain(session.provisional_words.iter().cloned())
+            .collect();
+        assert_eq!(confirmed_and_provisional, all_words);
+    }
+
     #[test]
     fn last_n_words_returns_tail_or_whole_string() {
         assert_eq!(last_n_words("a b c d e", 3), "c d e");
@@ -942,6 +1357,7 @@ mod tests {
             min_audio_s: 1.0,
             partial_min_words: 1,
             type_partials: true,
+            revision_mode: false,
         }
     }
 
@@ -983,6 +1399,84 @@ mod tests {
             .collect()
     }
 
+    /// Simulate what actually ends up on screen after applying every
+    /// event in order — `Partial`/`Final` append, `Replace` backspaces
+    /// `backspace` chars off the end first. This is what a revision-mode
+    /// test needs to assert on (unlike `emitted_text`, which only looks at
+    /// what was sent, not what survives after corrections).
+    fn reconstruct_typed_text(events: &[StreamingEvent]) -> String {
+        let mut screen = String::new();
+        for ev in events {
+            match ev {
+                StreamingEvent::Partial { text, .. } | StreamingEvent::Final { text, .. } => {
+                    screen.push_str(text);
+                }
+                StreamingEvent::Replace {
+                    backspace, text, ..
+                } => {
+                    let keep = screen.chars().count().saturating_sub(*backspace);
+                    screen = screen.chars().take(keep).collect();
+                    screen.push_str(text);
+                }
+                _ => {}
+            }
+        }
+        screen
+    }
+
+    /// Fake backend that replays a fixed sequence of transcriptions, one
+    /// per call, holding the last one for any further calls — for testing
+    /// revision mode's correction path (`FakeTranscriber`'s monotonic
+    /// growth never disagrees with itself, so it can't exercise Replace).
+    struct RevisingTranscriber {
+        calls: std::sync::Mutex<usize>,
+        sequence: Vec<&'static str>,
+    }
+
+    impl RevisingTranscriber {
+        fn new(sequence: Vec<&'static str>) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(0),
+                sequence,
+            }
+        }
+    }
+
+    impl Transcriber for RevisingTranscriber {
+        fn transcribe(&self, _samples: &[f32]) -> Result<String, TranscribeError> {
+            let mut calls = self.calls.lock().unwrap();
+            let idx = (*calls).min(self.sequence.len() - 1);
+            *calls += 1;
+            Ok(self.sequence[idx].to_string())
+        }
+    }
+
+    async fn run_session_with(
+        transcriber: Arc<dyn Transcriber>,
+        config: SlidingWindowConfig,
+        ticks: usize,
+    ) -> Vec<StreamingEvent> {
+        let engine = SlidingWindowStreamingTranscriber::new(transcriber, config);
+        let (tx, rx) = mpsc::channel::<Vec<f32>>(32);
+        let mut handle = engine.start_stream(rx).expect("start stream");
+
+        for _ in 0..ticks {
+            tx.send(loud_samples(0.5)).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+        drop(tx);
+
+        let mut events = Vec::new();
+        while let Some(ev) = handle.events.recv().await {
+            events.push(ev);
+            if matches!(events.last(), Some(StreamingEvent::Ended)) {
+                break;
+            }
+        }
+        handle.task.await.unwrap().expect("task ok");
+        events
+    }
+
     #[tokio::test]
     async fn session_emits_stable_deltas_then_final_flush_and_ended() {
         let events = run_session(streaming_config()).await;
@@ -1015,6 +1509,53 @@ mod tests {
         assert!(events
             .iter()
             .all(|ev| !matches!(ev, StreamingEvent::Partial { .. })));
+    }
+
+    #[tokio::test]
+    async fn revision_mode_end_to_end_reconstructs_final_transcript_via_growth_only() {
+        // FakeTranscriber never disagrees with itself, so this exercises
+        // the plain-Append path end-to-end through real events (no
+        // Replace expected) — a sanity check that revision mode doesn't
+        // regress the ordinary case.
+        let mut cfg = streaming_config();
+        cfg.revision_mode = true;
+        let events = run_session(cfg).await;
+
+        assert!(matches!(events.last(), Some(StreamingEvent::Ended)));
+        assert_eq!(reconstruct_typed_text(&events), "alpha beta gamma delta");
+    }
+
+    #[tokio::test]
+    async fn revision_mode_end_to_end_corrects_a_misheard_word() {
+        // Whisper's growing-buffer transcription first hears "lamp", then
+        // on a later pass corrects itself to "light" for the same word —
+        // exactly the live scenario revision mode exists for. Sequence
+        // indexed by call count (one call per ~0.5s chunk fed below); the
+        // buffer only has enough audio for a non-empty transcription from
+        // the 3rd chunk onward (min_audio_s = 1.0 in streaming_config()).
+        let transcriber: Arc<dyn Transcriber> = Arc::new(RevisingTranscriber::new(vec![
+            "",
+            "",
+            "turn on the lamp",
+            "turn on the lamp",
+            "turn on the light",
+            "turn on the light",
+        ]));
+        let mut cfg = streaming_config();
+        cfg.revision_mode = true;
+        let events = run_session_with(transcriber, cfg, 6).await;
+
+        assert!(matches!(events.last(), Some(StreamingEvent::Ended)));
+        assert!(
+            events
+                .iter()
+                .any(|ev| matches!(ev, StreamingEvent::Replace { .. })),
+            "expected a correction event, got {events:?}"
+        );
+        // The end result must be the corrected text, not a mix of both —
+        // this is the whole point: the wrong guess actually gets undone,
+        // not just papered over by later appends.
+        assert_eq!(reconstruct_typed_text(&events), "turn on the light");
     }
 
     #[tokio::test]

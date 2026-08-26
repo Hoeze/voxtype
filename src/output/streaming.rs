@@ -299,11 +299,25 @@ impl StreamingSession {
         Ok(())
     }
 
-    /// File-output counterpart to `replace_and_commit`: no backspaces —
-    /// there's nothing typed to revise — just fold the (now-superseded)
-    /// partial tail plus `text` into `finalized_text`, matching what the
-    /// typed path's accounting would produce.
-    pub fn replace_and_commit_silent(&mut self, text: &str) {
+    /// File-output counterpart to `replace_and_commit`: no real cursor to
+    /// send backspace keystrokes to, but `backspace` still means the same
+    /// thing — trim that many trailing chars off the accumulated
+    /// `partial` (a plain string edit, not a keystroke) before folding
+    /// the (now-truncated) partial tail plus `text` into `finalized_text`.
+    ///
+    /// Originally shipped ignoring `backspace` entirely under the
+    /// assumption that "no cursor" meant "nothing to revise" — wrong:
+    /// `backspace` describes how much of the already-accumulated string
+    /// is stale, independent of whether removing it is a keystroke or a
+    /// string truncation. Found live: revision mode's file-output
+    /// corrections landed as literal concatenations ("Open blue button.
+    /// bubbles." instead of "Open blue bubbles.") because the wrong
+    /// tail was never actually removed.
+    pub fn replace_and_commit_silent(&mut self, backspace: usize, text: &str) {
+        if backspace > 0 {
+            let new_partial_len = self.partial.chars().count().saturating_sub(backspace);
+            self.partial = self.partial.chars().take(new_partial_len).collect();
+        }
         if !text.is_empty() {
             let finalized_tail = format!("{}{}", self.partial, text);
             self.finalized_text.push_str(&finalized_tail);
@@ -578,6 +592,43 @@ mod tests {
         session.commit_segment_silent("hello");
         session.finalize_pending_partial();
         assert_eq!(session.finalized_text(), "hello");
+    }
+
+    #[test]
+    fn replace_and_commit_silent_trims_the_wrong_tail_before_appending() {
+        // Reproduces a real bug found live: revision mode's file-output
+        // corrections landed as literal concatenations instead of actual
+        // corrections, because replace_and_commit_silent ignored its
+        // `backspace` argument entirely. "Open blue button." (partial)
+        // then a Replace{backspace: 8, text: " bubbles."} correcting
+        // "button." (7 chars) + its leading space (1) must produce
+        // "Open blue bubbles.", not "Open blue button. bubbles.".
+        let mut session = StreamingSession::new();
+        session.observe_partial_delta("Open blue button.");
+        session.replace_and_commit_silent(8, " bubbles.");
+        assert_eq!(session.finalized_text(), "Open blue bubbles.");
+    }
+
+    #[test]
+    fn replace_and_commit_silent_zero_backspace_is_a_plain_append() {
+        let mut session = StreamingSession::new();
+        session.observe_partial_delta("hello");
+        session.replace_and_commit_silent(0, " world");
+        assert_eq!(session.finalized_text(), "hello world");
+    }
+
+    #[test]
+    fn replace_and_commit_silent_backspace_capped_at_partial_length() {
+        // A backspace count larger than what's actually pending in
+        // `partial` should not panic or reach into already-finalized
+        // text — same invariant `replace_and_commit` (the live-typing
+        // counterpart) relies on: corrections only ever touch the
+        // still-open partial tail, never truly-finalized content.
+        let mut session = StreamingSession::new();
+        session.commit_segment_silent("hello");
+        session.observe_partial_delta(" wor");
+        session.replace_and_commit_silent(999, "world");
+        assert_eq!(session.finalized_text(), "helloworld");
     }
 
     #[tokio::test]

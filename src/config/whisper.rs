@@ -132,6 +132,13 @@ pub struct WhisperConfig {
     #[serde(default = "default_streaming_type_partials")]
     pub streaming_type_partials: bool,
 
+    /// Experimental: type the current best-guess tail immediately and
+    /// correct it later via backspace + retype if a later tick disagrees,
+    /// instead of withholding it until two consecutive ticks agree. See
+    /// `transcribe::sliding_window`'s "Revision mode" doc section.
+    #[serde(default)]
+    pub streaming_revision_mode: bool,
+
     /// Initial prompt to provide context for transcription
     /// Use this to hint at terminology, proper nouns, or formatting conventions.
     /// Example: "Technical discussion about Rust, TypeScript, and Kubernetes."
@@ -239,6 +246,7 @@ impl Default for WhisperConfig {
             streaming_min_audio_secs: default_streaming_min_audio_secs(),
             streaming_partial_min_words: default_streaming_partial_min_words(),
             streaming_type_partials: default_streaming_type_partials(),
+            streaming_revision_mode: false,
             initial_prompt: None,
             secondary_model: None,
             available_models: vec![],

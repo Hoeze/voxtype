@@ -341,6 +341,7 @@ fn sliding_window_config_from_whisper(config: &Config) -> SlidingWindowConfig {
         min_audio_s: config.whisper.streaming_min_audio_secs,
         partial_min_words: config.whisper.streaming_partial_min_words,
         type_partials: config.whisper.streaming_type_partials,
+        revision_mode: config.whisper.streaming_revision_mode,
     }
 }
 
@@ -358,6 +359,7 @@ fn sliding_window_config_from_openvino(
         min_audio_s: openvino.streaming_min_audio_secs,
         partial_min_words: openvino.streaming_partial_min_words,
         type_partials: openvino.streaming_type_partials,
+        revision_mode: openvino.streaming_revision_mode,
     }
 }
 

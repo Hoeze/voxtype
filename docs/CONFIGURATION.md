@@ -1697,6 +1697,7 @@ Configuration for the OpenVINO Whisper speech-to-text engine. This section is on
 | `streaming_min_audio_secs` | Float | `1.0` | Min buffered audio (seconds) before the first partial is attempted |
 | `streaming_partial_min_words` | Integer | `1` | Min new stable words before a delta is committed/typed |
 | `streaming_type_partials` | Boolean | `true` | Type committed deltas live at the cursor, vs. commit whole segments at once |
+| `streaming_revision_mode` | Boolean | `false` | Experimental: type immediately and correct via backspace if wrong, instead of waiting for agreement |
 
 The model directory must contain the OpenVINO encoder and decoder XML/BIN files plus `tokenizer.json`. Available bundled short names include `"base.en-int8"`, `"base.en-fp16"`, `"small.en-int8"`, `"base-int8"`, and `"large-v3-int8"`.
 
@@ -1720,6 +1721,23 @@ mode = "toggle"
 
 [openvino]
 streaming = true
+```
+
+### openvino.streaming_revision_mode
+
+**Type:** Boolean
+**Default:** `false`
+**Required:** No
+**Status:** Experimental
+
+The default streaming gate withholds a word until it's agreed across two consecutive re-transcriptions — safe (never types something wrong) but can pause for a long stretch if Whisper keeps re-wording the same short phrase differently on every pass. Revision mode trades that safety for responsiveness: it types its current best guess immediately and corrects it later (backspace + retype, the same mechanism used to revise Soniox's punctuation flips) if a later pass disagrees. Once enough newer content has appeared behind a word (`REVISION_LAG_WORDS`, 4 words, not configurable), it's locked in and can never be revised again — bounding how far back any single correction can reach.
+
+This is a real, different failure mode from the default gate, not a strictly better version of it: instead of an occasional pause, you may occasionally see a word appear, then get backspaced and retyped differently, while dictating. For file-output sessions (`voxtype record start --file=path`) there's no real cursor involved — a "correction" is just an in-memory string edit — so this is the safer place to try it first. For live typing into an arbitrary focused window, a wrong backspace count could in principle remove characters that weren't typed by voxtype at all, if the daemon's own bookkeeping of what it typed ever drifts (e.g. focus moved mid-correction).
+
+```toml
+[openvino]
+streaming = true
+streaming_revision_mode = true
 ```
 
 ### openvino.openvino_dir

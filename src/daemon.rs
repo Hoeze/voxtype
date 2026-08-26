@@ -4133,7 +4133,7 @@ impl Daemon {
                         Some(StreamingEvent::Replace { backspace, text, .. }) => {
                             if let Some(s) = streaming_session.as_mut() {
                                 if file_output {
-                                    s.replace_and_commit_silent(&text);
+                                    s.replace_and_commit_silent(backspace, &text);
                                 } else if let Some(chain) = streaming_chain.as_ref() {
                                     if let Err(e) = s.replace_and_commit(
                                         chain,
