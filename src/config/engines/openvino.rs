@@ -71,6 +71,13 @@ pub struct OpenVinoConfig {
     /// segments at once (`false`).
     #[serde(default = "default_streaming_type_partials")]
     pub streaming_type_partials: bool,
+
+    /// Experimental: type the current best-guess tail immediately and
+    /// correct it later via backspace + retype if a later tick disagrees,
+    /// instead of withholding it until two consecutive ticks agree. See
+    /// `transcribe::sliding_window`'s "Revision mode" doc section.
+    #[serde(default)]
+    pub streaming_revision_mode: bool,
 }
 
 fn default_streaming_interval_secs() -> f32 {
@@ -123,6 +130,7 @@ impl Default for OpenVinoConfig {
             streaming_min_audio_secs: default_streaming_min_audio_secs(),
             streaming_partial_min_words: default_streaming_partial_min_words(),
             streaming_type_partials: default_streaming_type_partials(),
+            streaming_revision_mode: false,
         }
     }
 }
