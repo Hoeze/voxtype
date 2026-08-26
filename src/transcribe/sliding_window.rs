@@ -28,6 +28,22 @@
 //! The engine wraps any batch [`Transcriber`] (whisper.cpp, OpenVINO GenAI,
 //! …), so the same code powers every streaming backend.
 //!
+//! ## Known limitation: stability gating can stall on one unstable word
+//!
+//! The two-consecutive-pass stability check (both modes) requires the
+//! *entire* unconfirmed tail to match between passes before committing any
+//! of it — not just the specific word(s) still in flux. If Whisper keeps
+//! re-wording one short stretch differently on every single tick (found
+//! live: a phrase flickered between "Still said, okay." / "Still doesn't,
+//! okay." / "Still so okay." for 18+ consecutive seconds), nothing after
+//! that point can commit either, even though the rest of the tail is
+//! already well-formed. This isn't data loss — `final_flush` still catches
+//! it all at end-of-recording — but it can look like the transcript has
+//! stopped responding for an uncomfortably long stretch while the
+//! recording keeps running. Properly fixing this means gating stability
+//! per-word (or per-stable-run) instead of on the whole remaining delta;
+//! that's a real design change, not a quick patch, and hasn't been done.
+//!
 //! ## Event mapping
 //!
 //! Each committed delta is emitted as a [`StreamingEvent::Partial`] (typed
@@ -306,12 +322,32 @@ impl Session {
         if rms(&self.buffer) < self.config.min_speech_rms {
             return Ok(None);
         }
+        let infer_start = std::time::Instant::now();
         let text = self.base.transcribe(&self.buffer)?;
+        let infer_secs = infer_start.elapsed().as_secs_f32();
         let text = text.trim().to_string();
         tracing::trace!(
-            "[sliding] tick transcribe -> {text:?} ({} samples)",
-            self.buffer.len()
+            "[sliding] tick transcribe -> {text:?} ({} samples, {:.3}s infer, sliding={})",
+            self.buffer.len(),
+            infer_secs,
+            self.sliding,
         );
+        // Inference taking longer than the tick interval means every
+        // subsequent tick falls further behind, and incoming audio
+        // chunks queued on the bounded channel feeding this task start
+        // getting silently dropped (see `try_send` at the capture side)
+        // instead of backing up — the recording keeps running but the
+        // transcript stalls. Surface this loudly since it's otherwise
+        // invisible without trace logging.
+        if infer_secs > self.config.interval_s as f32 {
+            tracing::warn!(
+                "[sliding] inference ({:.2}s) exceeded the tick interval ({:.2}s) — \
+                 audio chunks may be getting dropped; buffer at {:.1}s",
+                infer_secs,
+                self.config.interval_s,
+                self.buffer.len() as f32 / self.config.sample_rate as f32,
+            );
+        }
         if text.is_empty() || is_hallucination(&text) {
             return Ok(None);
         }
@@ -336,15 +372,27 @@ impl Session {
             // been emitted, then only commit the portion of the delta that
             // was also present in the previous delta (stable across two
             // consecutive passes).
-            let already_emitted = self.full_text_parts.join(" ");
-            let mut delta = extract_new_text(&already_emitted, &curr);
+            let full_emitted = self.full_text_parts.join(" ");
+            let already_emitted = last_n_words(&full_emitted, SLIDING_DIFF_LOOKBACK_WORDS);
+            // `_confident`, not `extract_new_text`: no confident anchor
+            // this tick means "commit nothing, try again next tick" — see
+            // extract_new_text's doc comment for why guessing here (its
+            // length-based fallback) risks re-emitting already-committed
+            // text as a literal duplicate instead of just being briefly
+            // unresponsive.
+            let mut delta = extract_new_text_confident(&already_emitted, &curr).unwrap_or_default();
             let mut delta_words: Vec<String> =
                 delta.split_whitespace().map(str::to_owned).collect();
+            tracing::trace!(
+                "[sliding] sliding-diff: already_emitted(tail)={already_emitted:?} delta={delta:?} last_delta_words={:?}",
+                self.last_delta_words,
+            );
 
             if !self.last_delta_words.is_empty() && !delta_words.is_empty() {
                 let stable_n = common_prefix_len(&self.last_delta_words, &delta_words);
                 if stable_n >= self.config.partial_min_words {
                     let new = delta_words[..stable_n].join(" ");
+                    let new = dedupe_against_emitted(&self.full_text_parts.join(" "), &new);
                     let last_emitted = self.full_text_parts.last();
                     let not_repeat = last_emitted.map(|s| s != &new).unwrap_or(true);
                     if !new.is_empty() && not_repeat {
@@ -356,13 +404,21 @@ impl Session {
                         } else {
                             format!(" {new}")
                         };
+                        tracing::debug!("[sliding] COMMIT (sliding mode): {typed:?}");
                         self.full_text_parts.push(new);
                         deltas.push(typed);
                         // Re-diff so last_delta_words reflects the remaining
                         // unconfirmed words only.
-                        let already_emitted = self.full_text_parts.join(" ");
-                        delta = extract_new_text(&already_emitted, &curr);
+                        let full_emitted = self.full_text_parts.join(" ");
+                        let already_emitted =
+                            last_n_words(&full_emitted, SLIDING_DIFF_LOOKBACK_WORDS);
+                        delta =
+                            extract_new_text_confident(&already_emitted, &curr).unwrap_or_default();
                         delta_words = delta.split_whitespace().map(str::to_owned).collect();
+                    } else if !new.is_empty() {
+                        tracing::debug!(
+                            "[sliding] would-be commit suppressed as repeat of last: {new:?}"
+                        );
                     }
                 }
             }
@@ -376,6 +432,7 @@ impl Session {
                     let confirmed_new = &curr_words[self.confirmed_words.len()..stable_n];
                     if confirmed_new.len() >= self.config.partial_min_words {
                         let new = confirmed_new.join(" ");
+                        let new = dedupe_against_emitted(&self.full_text_parts.join(" "), &new);
                         let last_emitted = self.full_text_parts.last();
                         let not_repeat = last_emitted.map(|s| s != &new).unwrap_or(true);
                         if !new.is_empty() && not_repeat {
@@ -387,6 +444,7 @@ impl Session {
                             } else {
                                 format!(" {new}")
                             };
+                            tracing::debug!("[sliding] COMMIT (growing mode): {typed:?}");
                             self.full_text_parts.push(new);
                             self.confirmed_words.extend(confirmed_new.iter().cloned());
                             deltas.push(typed);
@@ -408,9 +466,11 @@ impl Session {
             Ok(Some(t)) => t,
             _ => return None,
         };
-        let already_emitted = self.full_text_parts.join(" ");
+        let full_emitted = self.full_text_parts.join(" ");
+        let already_emitted = last_n_words(&full_emitted, SLIDING_DIFF_LOOKBACK_WORDS);
         let delta = extract_new_text(&already_emitted, &final_text);
         let delta = delta.trim().to_string();
+        let delta = dedupe_against_emitted(&full_emitted, &delta);
         if delta.is_empty() {
             None
         } else {
@@ -457,7 +517,58 @@ fn common_prefix_len<T: AsRef<str>>(a: &[T], b: &[T]) -> usize {
     i
 }
 
-/// Return the portion of `curr` that is new compared to `prev`.
+/// How many trailing words of already-committed text to hand to
+/// `extract_new_text` as `prev` in sliding mode. Just enough for anchor
+/// matching (strategies 1-3 below) — deliberately NOT the whole session.
+///
+/// `extract_new_text`'s strategy 4 safety check ("Whisper may have fully
+/// rewritten the window") compares `curr_words.len()` against
+/// `prev_words.len()` and bails to `""` once curr isn't longer. In sliding
+/// mode `curr` is always just one ~29s window's worth of words, but
+/// `full_text_parts.join(" ")` is the ENTIRE session's cumulative
+/// committed text, growing without bound. Once a long-running session's
+/// total committed word count exceeds one window's worth (a couple of
+/// minutes of continuous dictation, easily), `prev` becomes permanently
+/// longer than `curr` and strategy 4 never fires again — the transcript
+/// silently and permanently stops advancing, even though new speech keeps
+/// transcribing correctly tick over tick. Found live: a 60s recording
+/// stopped committing any new text at all about 15s into sliding mode,
+/// with every subsequent tick logging `delta=""` despite the raw
+/// transcription clearly growing.
+const SLIDING_DIFF_LOOKBACK_WORDS: usize = 20;
+
+/// Trailing `n` words of `text` (or the whole thing if shorter).
+fn last_n_words(text: &str, n: usize) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let start = words.len().saturating_sub(n);
+    words[start..].join(" ")
+}
+
+/// Strip any leading words of `candidate` that restate the tail of
+/// `already_emitted` — a defense-in-depth guard applied right before a
+/// segment is actually committed, independent of whichever diff produced
+/// `candidate` in the first place.
+///
+/// The per-tick diffs already try hard to avoid proposing a duplicate, but
+/// they compare against the *whole* current window (`curr`), which is a
+/// much noisier, harder match than comparing the final short candidate
+/// segment directly against what's already committed. Found live: a
+/// duplicate slipped through right at the growing→sliding mode transition
+/// — growing mode committed "...and then it spits it out." via its own
+/// word-prefix tracking, then sliding mode's first commit re-included
+/// "and then it spits it out." verbatim before its genuinely new tail.
+/// The two modes track diffing state independently and can briefly
+/// disagree about exactly where the boundary falls; this check catches
+/// that regardless of which mode is active or why the disagreement
+/// happened, rather than trying to keep both modes' state in perfect sync
+/// across the transition.
+fn dedupe_against_emitted(already_emitted_full: &str, candidate: &str) -> String {
+    let tail = last_n_words(already_emitted_full, SLIDING_DIFF_LOOKBACK_WORDS);
+    extract_new_text_confident(&tail, candidate).unwrap_or_else(|| candidate.to_string())
+}
+
+/// Return the portion of `curr` that is new compared to `prev`, using only
+/// strategies that anchor on a real, verified match — never a guess.
 ///
 /// Strategies, in order:
 /// 1. Longest suffix→prefix word overlap (the common case).
@@ -465,21 +576,24 @@ fn common_prefix_len<T: AsRef<str>>(a: &[T], b: &[T]) -> usize {
 /// 3. Greedy forward scan — how far into `curr` the `prev` words reach,
 ///    trusting the position when ≥50% matched (handles Whisper punctuation
 ///    / casing rewrites).
-/// 4. Safety: if `curr` is not substantially longer, Whisper is refining —
-///    no new text; otherwise emit only the tail beyond `prev`'s length.
-fn extract_new_text(prev: &str, curr: &str) -> String {
+///
+/// Returns `None` when none of these find a confident anchor — the caller
+/// should treat that as "nothing safe to commit this pass", not as "no new
+/// text". See `extract_new_text`'s doc comment for why this distinction
+/// matters for repeated tick callers.
+fn extract_new_text_confident(prev: &str, curr: &str) -> Option<String> {
     if prev.is_empty() {
-        return curr.to_string();
+        return Some(curr.to_string());
     }
     if curr.is_empty() {
-        return String::new();
+        return Some(String::new());
     }
 
     let prev_words: Vec<&str> = prev.split_whitespace().collect();
     let curr_words: Vec<&str> = curr.split_whitespace().collect();
 
     if prev_words.is_empty() || curr_words.is_empty() {
-        return curr.to_string();
+        return Some(curr.to_string());
     }
 
     // 1. Exact suffix→prefix overlap (longest wins).
@@ -493,12 +607,12 @@ fn extract_new_text(prev: &str, curr: &str) -> String {
         }
     }
     if best_overlap > 0 {
-        return curr_words[best_overlap..].join(" ");
+        return Some(curr_words[best_overlap..].join(" "));
     }
 
     // 2. Verbatim prefix check.
     if let Some(rest) = curr.strip_prefix(prev) {
-        return rest.trim().to_string();
+        return Some(rest.trim().to_string());
     }
 
     // 3. Greedy forward scan.
@@ -515,10 +629,44 @@ fn extract_new_text(prev: &str, curr: &str) -> String {
         // else: skip — Whisper rewrote this word, keep scanning.
     }
     if pi as f32 >= prev_words.len() as f32 * 0.5 {
-        return curr_words[best_ci..].join(" ");
+        return Some(curr_words[best_ci..].join(" "));
+    }
+
+    None
+}
+
+/// Return the portion of `curr` that is new compared to `prev`.
+///
+/// Tries [`extract_new_text_confident`]'s real-anchor strategies first,
+/// then falls back to a length-based guess: if `curr` is not substantially
+/// longer than `prev`, Whisper is refining — no new text; otherwise emit
+/// only the tail beyond `prev`'s length.
+///
+/// **This last-resort guess assumes `curr` = `prev` + some new suffix** —
+/// true for a single growing buffer re-transcribed in place, but NOT true
+/// for the sliding-window tick loop, where `curr` is an independently
+/// re-transcribed rolling window and `prev` is a bounded recent tail of
+/// the whole session's committed text (see `SLIDING_DIFF_LOOKBACK_WORDS`).
+/// Once the genuinely-overlapping part of that tail ages out of the
+/// window, this guess's fixed word-count strip no longer lines up with
+/// where new content actually starts, and can re-emit already-committed
+/// phrasing as if it were new — found live as literal duplicated
+/// sentences after a ~50s continuous recording with several repeated
+/// filler phrases. `on_tick`'s sliding-mode branch calls
+/// `extract_new_text_confident` directly instead, treating "no confident
+/// anchor" as "commit nothing this tick" (self-corrects next tick) rather
+/// than risk a wrong guess compounding into visible duplication. This
+/// function (with the guess) is still right for `final_flush`: a single
+/// best-effort guess at the true end of a recording, with no further
+/// ticks to compound the mistake, beats losing the trailing text outright.
+fn extract_new_text(prev: &str, curr: &str) -> String {
+    if let Some(text) = extract_new_text_confident(prev, curr) {
+        return text;
     }
 
     // 4. Safety: Whisper may have fully rewritten the window.
+    let prev_words: Vec<&str> = prev.split_whitespace().collect();
+    let curr_words: Vec<&str> = curr.split_whitespace().collect();
     if curr_words.len() <= prev_words.len() + 1 {
         return String::new();
     }
@@ -608,6 +756,137 @@ mod tests {
     fn extract_new_text_safety_tail() {
         // No overlap, prev unreachable via fuzzy scan, curr much longer.
         assert_eq!(extract_new_text("x y", "a b c d"), "c d");
+    }
+
+    #[test]
+    fn extract_new_text_confident_declines_the_safety_guess() {
+        // Same inputs as extract_new_text_safety_tail: no strategies 1-3
+        // anchor succeeds. extract_new_text guesses "c d" (strategy 4);
+        // the confident variant refuses to guess at all.
+        assert_eq!(extract_new_text_confident("x y", "a b c d"), None);
+    }
+
+    #[test]
+    fn sliding_mode_duplicate_reproduction_and_fix() {
+        // Reproduces the shape of a real duplicate/garbled-text bug found
+        // live on a ~55s recording with repeated filler phrasing. Once the
+        // genuinely-overlapping tail of `already_emitted` no longer
+        // matches curr's start via strategies 1-3 (Whisper re-transcribed
+        // that stretch slightly differently this pass), extract_new_text's
+        // strategy 4 blindly strips `prev_words.len()` words off curr's
+        // front on the assumption curr = prev + new suffix. That
+        // assumption is wrong in sliding mode (curr is an independently
+        // re-transcribed window, not a continuation of prev), so the cut
+        // point is arbitrary and can land inside content curr is restating
+        // from `prev` — bleeding a fragment of already-committed text back
+        // into the "new" output as a garbled partial repeat.
+        let prev = "roses are red violets";
+        // curr restates content overlapping `prev` ("sugar is sweet" is
+        // new to `prev`, but conceptually the kind of near-repeat that
+        // trips this up), worded so strategies 1-3 all fail to anchor:
+        // curr's first word ("sky") doesn't appear anywhere in `prev`, so
+        // no suffix/prefix overlap or fuzzy-scan match is possible.
+        let curr = "sky is blue sugar is sweet and so are you my friend";
+        assert_eq!(extract_new_text_confident(prev, curr), None);
+
+        // The bug: extract_new_text's guess strips exactly 4 words
+        // (prev_words.len()) off curr's front — an arbitrary cut with no
+        // relationship to where curr's genuinely new content starts —
+        // leaving "is sweet" as a stray fragment in the output.
+        let guessed = extract_new_text(prev, curr);
+        assert_eq!(guessed, "is sweet and so are you my friend");
+
+        // The fix: the confident variant refuses to guess when no real
+        // anchor is found, so the sliding-mode tick loop commits nothing
+        // this pass instead of emitting that garbled fragment — it catches
+        // up once Whisper's wording stabilizes enough for a real anchor on
+        // a later tick.
+    }
+
+    #[test]
+    fn dedupe_strips_overlap_at_growing_to_sliding_transition() {
+        // Reproduces a real duplicate found live: growing mode committed
+        // "...and then it spits it out." via its own word-prefix tracking,
+        // then the very first sliding-mode commit re-included "and then it
+        // spits it out." verbatim before its genuinely new tail — the two
+        // modes track diffing state independently and briefly disagreed
+        // about exactly where the boundary fell.
+        let already_emitted = "It takes a little bit, bit, and then it spits it out.";
+        let candidate =
+            "and then it spits it out. Yeah, that's what we like to see. I think this is nice.";
+        assert_eq!(
+            dedupe_against_emitted(already_emitted, candidate),
+            "Yeah, that's what we like to see. I think this is nice."
+        );
+    }
+
+    #[test]
+    fn dedupe_leaves_genuinely_new_text_untouched() {
+        let already_emitted = "hello world";
+        let candidate = "completely unrelated new content";
+        assert_eq!(
+            dedupe_against_emitted(already_emitted, candidate),
+            candidate
+        );
+    }
+
+    #[test]
+    fn last_n_words_returns_tail_or_whole_string() {
+        assert_eq!(last_n_words("a b c d e", 3), "c d e");
+        assert_eq!(last_n_words("a b", 3), "a b");
+        assert_eq!(last_n_words("", 3), "");
+        assert_eq!(last_n_words("a b c", 0), "");
+    }
+
+    #[test]
+    fn long_session_stall_reproduction_and_fix() {
+        // Reproduces the empty-forever bug found live on a 60s recording:
+        // once a sliding-mode session's cumulative committed text exceeds
+        // one window's worth of words, extract_new_text's strategy-4
+        // safety check ("curr not substantially longer than prev") starts
+        // comparing curr against the WHOLE session instead of just the
+        // recent tail, and permanently returns "" even though curr keeps
+        // growing with genuinely new speech every tick.
+        let mut committed_history: Vec<&str> = Vec::new();
+        for i in 0..80 {
+            committed_history.push(if i % 2 == 0 { "word" } else { "other" });
+        }
+        let full_emitted = committed_history.join(" "); // 80 words, no overlap with curr below
+
+        // curr: a fresh ~29s window's transcript, entirely new content
+        // (as if the old committed words have aged out of the window),
+        // with no exact overlap with `full_emitted` at all — forcing
+        // strategy 4 (the length-based safety net) to be the deciding
+        // factor, exactly as happens once repeated/rewritten phrasing
+        // defeats strategies 1-3 in practice. Must be longer than
+        // SLIDING_DIFF_LOOKBACK_WORDS for strategy 4 to have anything to
+        // work with once `prev` is properly bounded.
+        let curr = "brand new content the user just said in this window \
+                     that should absolutely without question be committed \
+                     as a real delta and not silently dropped on the floor";
+        let curr_words: Vec<&str> = curr.split_whitespace().collect();
+        assert!(curr_words.len() > SLIDING_DIFF_LOOKBACK_WORDS);
+
+        // The bug: diffing against the entire unbounded session history.
+        assert_eq!(
+            extract_new_text(&full_emitted, curr),
+            "",
+            "sanity check: this is the exact failure mode observed live"
+        );
+
+        // The fix: bound `prev` to a small recent tail before diffing.
+        // Strategy 4 then strips only SLIDING_DIFF_LOOKBACK_WORDS words off
+        // curr's front (its usual "assume that much was already emitted"
+        // heuristic) instead of freezing solid — the point of the fix is
+        // that *something* keeps flowing, not that it's a perfect diff.
+        let bounded = last_n_words(&full_emitted, SLIDING_DIFF_LOOKBACK_WORDS);
+        assert_eq!(
+            bounded.split_whitespace().count(),
+            SLIDING_DIFF_LOOKBACK_WORDS
+        );
+        let expected = curr_words[SLIDING_DIFF_LOOKBACK_WORDS..].join(" ");
+        assert_eq!(extract_new_text(&bounded, curr), expected);
+        assert!(!expected.is_empty());
     }
 
     #[test]
