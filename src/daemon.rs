@@ -1712,8 +1712,9 @@ impl Daemon {
                                         tracker.observe(frame.peak_dbfs).await;
                                     }
                                 }
-                                if streaming_tx.try_send(chunk).is_err() {
+                                if let Err(e) = streaming_tx.try_send(chunk) {
                                     // Backend slow or gone; drop and keep going.
+                                    tracing::trace!("streaming sample tap try_send failed: {}", e);
                                 }
                             }
                         })
