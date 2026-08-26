@@ -563,6 +563,20 @@ impl Session {
         deltas
     }
 
+    /// Revision mode: the trailing window of permanently-confirmed text to
+    /// diff `curr` against. Shared by `revision_new_tail` and
+    /// `final_flush`'s end-of-session fallback guess.
+    fn revision_confirmed_text(&self) -> String {
+        last_n_words(
+            &if self.sliding {
+                self.full_text_parts.join(" ")
+            } else {
+                self.confirmed_words.join(" ")
+            },
+            SLIDING_DIFF_LOOKBACK_WORDS,
+        )
+    }
+
     /// Revision mode: this tick's full best-guess of everything beyond
     /// permanently-confirmed text, or `None` if no confident determination
     /// could be made this pass (sliding mode only — see
@@ -587,15 +601,7 @@ impl Session {
         // (same confident-anchor-only strategy sliding mode already
         // uses) is immune to this: it verifies the confirmed tail is
         // still actually present before treating anything past it as new.
-        let confirmed_text = last_n_words(
-            &if self.sliding {
-                self.full_text_parts.join(" ")
-            } else {
-                self.confirmed_words.join(" ")
-            },
-            SLIDING_DIFF_LOOKBACK_WORDS,
-        );
-        extract_new_text_confident(&confirmed_text, curr)
+        extract_new_text_confident(&self.revision_confirmed_text(), curr)
             .map(|s| s.split_whitespace().map(str::to_owned).collect())
     }
 
@@ -671,9 +677,28 @@ impl Session {
         };
 
         if self.config.revision_mode {
-            return self
-                .revision_new_tail(&final_text)
-                .and_then(|tail| self.reconcile_revision(tail));
+            // Unlike `on_tick`, there is no next tick to wait for: this is
+            // the true end of the session. Found live on a 60s recording
+            // that hit its hard timeout mid-babble — `revision_new_tail`
+            // declined to anchor on the very last pass (correctly, per its
+            // own doc comment, for an *ongoing* session) and nothing ever
+            // corrected the on-screen text afterward, because nothing
+            // else was ever going to run. Fall back to a single
+            // best-effort guess (`extract_new_text`'s safety strategy)
+            // the same way commit-only mode's own final_flush below
+            // already does, and for the same reason: a guess that might
+            // occasionally garble the last few words beats leaving
+            // whatever the last confident pass happened to type,
+            // uncorrected, forever.
+            let tail = self.revision_new_tail(&final_text).or_else(|| {
+                let guess = extract_new_text(&self.revision_confirmed_text(), &final_text);
+                if guess.is_empty() {
+                    None
+                } else {
+                    Some(guess.split_whitespace().map(str::to_owned).collect())
+                }
+            });
+            return tail.and_then(|t| self.reconcile_revision(t));
         }
 
         let full_emitted = self.full_text_parts.join(" ");
@@ -1083,6 +1108,35 @@ mod tests {
         let mut cfg = streaming_config();
         cfg.revision_mode = true;
         Session::new(Arc::new(FakeTranscriber), cfg)
+    }
+
+    #[test]
+    fn final_flush_falls_back_to_a_best_effort_guess_when_no_confident_anchor_exists() {
+        // Reproduces a real gap found live: a 60s recording hit its hard
+        // timeout mid-sentence, and the very last transcription pass
+        // reworded the trailing content so thoroughly that
+        // `extract_new_text_confident` had no anchor to re-attach it to
+        // (same shape as `extract_new_text_confident_declines_the_safety_guess`).
+        // In the tick loop, declining and waiting for the next tick is
+        // correct; at `final_flush` there is no next tick — declining
+        // there just leaves whatever the previous, less-accurate guess
+        // typed on screen forever, uncorrected. commit-only mode's own
+        // final_flush already falls back to `extract_new_text`'s safety
+        // guess for exactly this reason; revision mode must too.
+        let mut session = revision_session();
+        session.confirmed_words = words("x y");
+        session.feed(&loud_samples(1.5));
+        session.base = Arc::new(RevisingTranscriber::new(vec!["a b c d"]));
+
+        let delta = session
+            .final_flush()
+            .expect("must fall back to a guess instead of silently giving up");
+
+        assert_eq!(
+            delta,
+            Delta::Append("c d".to_string()),
+            "should type the safety-guess tail rather than leave nothing corrected"
+        );
     }
 
     #[test]
