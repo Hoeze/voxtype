@@ -19,6 +19,7 @@ mod parse;
 mod profile;
 mod root;
 mod status;
+mod streaming;
 mod text;
 mod vad;
 mod whisper;
@@ -44,6 +45,7 @@ pub use output::{
 pub use profile::{PostProcessConfig, Profile};
 pub use root::Config;
 pub use status::{ResolvedIcons, StatusConfig, StatusIconOverrides};
+pub use streaming::StreamingConfig;
 pub use text::TextConfig;
 pub use vad::{VadBackend, VadConfig};
 pub use whisper::{WhisperConfig, WhisperMode};

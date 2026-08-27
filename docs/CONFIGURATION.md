@@ -886,6 +886,30 @@ voxtype --eager-processing --eager-overlap-secs 1.0 daemon
 - More overlap: Better word boundary handling, slightly more processing
 - Less overlap: Faster processing, but may miss words at boundaries
 
+### streaming
+
+**Type:** Boolean
+**Default:** `false`
+**Required:** No
+
+Enables live streaming transcription via the sliding-window engine: text lands at the cursor incrementally as you speak instead of only after the hotkey is released. Only applies to `mode = "local"`.
+
+Tuning (re-transcription interval, buffer size, etc.) lives in the shared `[streaming]` section below, since `[openvino] streaming` wraps the same engine. `[whisper]` also still accepts its own `streaming_interval_secs` / `streaming_max_buffer_secs` / `streaming_min_speech_rms` / `streaming_min_audio_secs` / `streaming_partial_min_words` / `streaming_type_partials` / `streaming_revision_mode` fields for backward compatibility — they're used only when config.toml has no `[streaming]` section.
+
+**Requires toggle activation** for the same libinput reason documented under [`openvino.streaming`](#openvinostreaming) below: push-to-talk is auto-promoted to toggle at startup when this is enabled.
+
+**Example:**
+```toml
+[hotkey]
+mode = "toggle"
+
+[whisper]
+streaming = true
+
+[streaming]
+interval_secs = 0.8
+```
+
 ### initial_prompt
 
 **Type:** String
@@ -1150,6 +1174,48 @@ sudo cp build/bin/whisper-cli /usr/local/bin/
 
 ---
 
+## [streaming]
+
+Tuning for the sliding-window streaming engine (`transcribe::sliding_window`): a rolling audio buffer is re-transcribed on an interval and stable-prefix deltas are emitted as you speak. Shared by every engine that wraps itself in this engine — currently `[whisper] streaming` and `[openvino] streaming` — so it's configured once here instead of once per engine. It has nothing to do with Parakeet's own cache-aware streaming pipeline (`[parakeet] streaming`) or Soniox's cloud WebSocket streaming (`[soniox] streaming`), which are different mechanisms that happen to share the word "streaming".
+
+This section is entirely optional. Omitting it (or omitting individual fields inside it) falls back to each engine's own deprecated `streaming_*` fields — see the compatibility note at the end of this section.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `interval_secs` | Float | `0.8` | Seconds between re-transcriptions of the rolling buffer. Lower = more responsive partials, higher CPU/NPU cost |
+| `max_buffer_secs` | Float | `29.0` | Max buffered audio (seconds) before the window slides (drops old samples to respect the model's context limit) |
+| `min_speech_rms` | Float | `0.005` | Skip transcription while whole-buffer RMS is below this |
+| `min_audio_secs` | Float | `1.0` | Min buffered audio (seconds) before the first partial is attempted |
+| `partial_min_words` | Integer | `1` | Min new stable words before a delta is committed/typed |
+| `type_partials` | Boolean | `true` | Type committed deltas live at the cursor, vs. commit whole segments at once |
+| `revision_mode` | Boolean | `false` | Experimental: type immediately and correct via backspace if wrong, instead of waiting for agreement. See `openvino.streaming_revision_mode` in the `[openvino]` section for the full explanation of the trade-off — it applies identically here |
+
+**Example:**
+```toml
+[hotkey]
+mode = "toggle"   # Required for streaming — see [whisper] streaming above
+
+[whisper]
+streaming = true
+
+[streaming]
+interval_secs = 0.5        # More responsive, more CPU/NPU load
+max_buffer_secs = 20.0
+partial_min_words = 2
+```
+
+### Compatibility with the old per-engine fields
+
+Before this section existed, `[whisper]` and `[openvino]` each carried their own verbatim copy of these seven fields, prefixed `streaming_` (e.g. `[whisper] streaming_interval_secs`). Those fields still work:
+
+- If `[streaming]` is present in config.toml, it wins outright for every engine that uses the sliding-window engine, and any old per-engine `streaming_*` fields are ignored.
+- If `[streaming]` is absent, each engine falls back to its own `streaming_*` fields (or their defaults, which are identical to `[streaming]`'s defaults).
+- The first time an old per-engine field is actually carrying a non-default value and gets used as a fallback, the daemon logs a one-time warning suggesting the migration. An old config that never touched these fields sees no warning and no behavior change.
+
+There's no need to migrate an existing config that already works the way you want — the old fields aren't going away.
+
+---
+
 ## [parakeet]
 
 Configuration for the Parakeet speech-to-text engine. This section is only used when `engine = "parakeet"`.
@@ -1218,7 +1284,9 @@ on_demand_loading = true  # Free memory when not transcribing
 
 When `true`, voxtype types text incrementally while you are still speaking
 instead of waiting for hotkey release. Uses the parakeet-rs cache-aware
-streaming pipeline and a TDT v3 family model with `tokenizer.model`.
+streaming pipeline and a TDT v3 family model with `tokenizer.model` — a
+different mechanism from the shared `[streaming]` section used by
+`[whisper] streaming` and `[openvino] streaming`, and not configured by it.
 
 **Requires toggle activation.** Streaming output types characters at the
 cursor while you dictate. On Wayland compositors backed by libinput
@@ -1690,16 +1758,11 @@ Configuration for the OpenVINO Whisper speech-to-text engine. This section is on
 | `language` | String | `"en"` | Whisper language code |
 | `translate` | Boolean | `false` | Translate non-English speech to English |
 | `on_demand_loading` | Boolean | `false` | Load the model when recording begins |
-| `streaming` | Boolean | `false` | Live streaming transcription via the sliding-window engine |
-| `streaming_interval_secs` | Float | `0.8` | Seconds between re-transcriptions of the rolling buffer |
-| `streaming_max_buffer_secs` | Float | `29.0` | Max buffered audio (seconds) before the window slides |
-| `streaming_min_speech_rms` | Float | `0.005` | Skip transcription while whole-buffer RMS is below this |
-| `streaming_min_audio_secs` | Float | `1.0` | Min buffered audio (seconds) before the first partial is attempted |
-| `streaming_partial_min_words` | Integer | `1` | Min new stable words before a delta is committed/typed |
-| `streaming_type_partials` | Boolean | `true` | Type committed deltas live at the cursor, vs. commit whole segments at once |
-| `streaming_revision_mode` | Boolean | `false` | Experimental: type immediately and correct via backspace if wrong, instead of waiting for agreement |
+| `streaming` | Boolean | `false` | Live streaming transcription via the shared sliding-window engine — see `[streaming]` for tuning |
 
 The model directory must contain the OpenVINO encoder and decoder XML/BIN files plus `tokenizer.json`. Available bundled short names include `"base.en-int8"`, `"base.en-fp16"`, `"small.en-int8"`, `"base-int8"`, and `"large-v3-int8"`.
+
+`[openvino]` also still accepts its own deprecated `streaming_interval_secs` / `streaming_max_buffer_secs` / `streaming_min_speech_rms` / `streaming_min_audio_secs` / `streaming_partial_min_words` / `streaming_type_partials` / `streaming_revision_mode` fields — identical knobs to the ones now documented under `[streaming]` — used only as a fallback when config.toml has no `[streaming]` section. See the compatibility note at the end of the `[streaming]` section.
 
 ### Compiled model caching
 
@@ -1713,7 +1776,7 @@ Safe to delete (`rm -rf ~/.cache/voxtype/openvino`) if you switch models/devices
 **Default:** `false`
 **Required:** No
 
-Enables live streaming transcription: text lands incrementally as you speak instead of only after the hotkey is released, via the same sliding-window engine `[whisper] streaming` uses (re-transcribes a rolling audio buffer on an interval and emits stable-prefix deltas). Requires `[hotkey] mode = "toggle"` — push-to-talk is auto-promoted to toggle when this is set (see `Config::streaming_active`), since typing at the cursor while a key is physically held clobbers libinput's held-key tracking on Hyprland/Sway/River.
+Enables live streaming transcription: text lands incrementally as you speak instead of only after the hotkey is released, via the same shared sliding-window engine `[whisper] streaming` uses (re-transcribes a rolling audio buffer on an interval and emits stable-prefix deltas — see `[streaming]` for the tuning knobs). Requires `[hotkey] mode = "toggle"` — push-to-talk is auto-promoted to toggle when this is set (see `Config::streaming_active`), since typing at the cursor while a key is physically held clobbers libinput's held-key tracking on Hyprland/Sway/River.
 
 ```toml
 [hotkey]
@@ -1730,7 +1793,7 @@ streaming = true
 **Required:** No
 **Status:** Experimental
 
-The default streaming gate withholds a word until it's agreed across two consecutive re-transcriptions — safe (never types something wrong) but can pause for a long stretch if Whisper keeps re-wording the same short phrase differently on every pass. Revision mode trades that safety for responsiveness: it types its current best guess immediately and corrects it later (backspace + retype, the same mechanism used to revise Soniox's punctuation flips) if a later pass disagrees. Once enough newer content has appeared behind a word (`REVISION_LAG_WORDS`, 4 words, not configurable), it's locked in and can never be revised again — bounding how far back any single correction can reach.
+Same setting as the shared `[streaming] revision_mode`, kept here as a deprecated fallback (see the `[streaming]` section's compatibility note). The default streaming gate withholds a word until it's agreed across two consecutive re-transcriptions — safe (never types something wrong) but can pause for a long stretch if Whisper keeps re-wording the same short phrase differently on every pass. Revision mode trades that safety for responsiveness: it types its current best guess immediately and corrects it later (backspace + retype, the same mechanism used to revise Soniox's punctuation flips) if a later pass disagrees. Once enough newer content has appeared behind a word (`REVISION_LAG_WORDS`, 4 words, not configurable), it's locked in and can never be revised again — bounding how far back any single correction can reach.
 
 This is a real, different failure mode from the default gate, not a strictly better version of it: instead of an occasional pause, you may occasionally see a word appear, then get backspaced and retyped differently, while dictating. For file-output sessions (`voxtype record start --file=path`) there's no real cursor involved — a "correction" is just an in-memory string edit — so this is the safer place to try it first. For live typing into an arbitrary focused window, a wrong backspace count could in principle remove characters that weren't typed by voxtype at all, if the daemon's own bookkeeping of what it typed ever drifts (e.g. focus moved mid-correction).
 

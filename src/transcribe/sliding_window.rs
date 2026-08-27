@@ -211,7 +211,13 @@ impl Default for SlidingWindowConfig {
             sample_rate: 16_000,
             min_speech_rms: MIN_SPEECH_RMS,
             min_audio_s: 1.0,
-            partial_min_words: 2,
+            // Matches the production default in config::StreamingConfig
+            // (both whisper and openvino configs default this to 1). This
+            // Default impl isn't constructed anywhere in production code
+            // today (every real caller builds the struct field-by-field
+            // from resolved config), but a stray `2` here was a trap for
+            // any future caller who assumes it matches config defaults.
+            partial_min_words: 1,
             type_partials: true,
             revision_mode: false,
         }
