@@ -3386,6 +3386,16 @@ const OPENVINO_MODEL_FILES: &[&str] = &[
     "tokenizer.json",
     "config.json",
     "generation_config.json",
+    // Mel-spectrogram feature-extraction params (n_mels/hop_length/etc).
+    // Not needed to *construct* a WhisperPipeline -- only the .xml/.bin
+    // graphs above are -- but OpenVINO GenAI reads it internally on the
+    // first real transcription call, so its absence didn't show up here;
+    // it surfaced downstream as an opaque "unknown exception" instead.
+    // Fetched per-model like everything else above (the URL below is
+    // templated with `model.huggingface_repo`), which matters since this
+    // file isn't identical across sizes -- large-v3/large-v3-turbo use
+    // 128 mel bins, everything else uses 80.
+    "preprocessor_config.json",
 ];
 
 const OPENVINO_MODELS: &[OpenVinoModelInfo] = &[
@@ -3703,6 +3713,12 @@ pub fn download_openvino_model(model_name: &str) -> anyhow::Result<()> {
         let status = Command::new("curl")
             .args([
                 "-L",
+                "-f", // treat HTTP error responses (404, ...) as a failure --
+                      // without this, curl "successfully" saves the error
+                      // page's body as the model file instead of erroring,
+                      // which is exactly how a file silently missing from
+                      // this list (see preprocessor_config.json above)
+                      // could go unnoticed instead of failing the download.
                 "--progress-bar",
                 "-o",
                 file_path.to_str().unwrap_or("file"),
@@ -3767,6 +3783,11 @@ pub fn validate_openvino_model(path: &std::path::Path) -> anyhow::Result<()> {
         "openvino_decoder_model.xml",
         "openvino_decoder_model.bin",
         "tokenizer.json",
+        // Not needed to construct the pipeline, but its absence isn't
+        // caught until the first real transcription call otherwise --
+        // see OPENVINO_MODEL_FILES's comment and
+        // OpenVinoTranscriber::new's preprocessor_config check.
+        "preprocessor_config.json",
     ];
     for file in &required {
         if !path.join(file).exists() {
