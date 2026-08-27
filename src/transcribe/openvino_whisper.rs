@@ -38,7 +38,40 @@ pub struct OpenVinoTranscriber {
     config: OpenVinoConfig,
 }
 
+fn device_candidates(configured: &str) -> Vec<&str> {
+    let mut candidates = vec![configured];
+    for device in ["GPU", "CPU"] {
+        if !candidates
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(device))
+        {
+            candidates.push(device);
+        }
+    }
+    candidates
+}
+
 impl OpenVinoTranscriber {
+    fn require_preprocessor_config(
+        model_dir: &std::path::Path,
+        model_name: &str,
+    ) -> Result<(), TranscribeError> {
+        let path = model_dir.join("preprocessor_config.json");
+        if path.exists() {
+            return Ok(());
+        }
+
+        Err(TranscribeError::ModelNotFound(format!(
+            "OpenVINO Whisper model at {} is missing preprocessor_config.json. \
+             OpenVINO reads this file on the first transcription, so pipeline startup \
+             can otherwise succeed before inference fails with an opaque \"unknown exception\".\n  \
+             Re-download the model with:\n  \
+             voxtype setup --download --model {}",
+            model_dir.display(),
+            model_name,
+        )))
+    }
+
     /// Create a new OpenVINO GenAI Whisper transcriber.
     ///
     /// Resolves the model directory and optionally creates the pipeline immediately
@@ -65,31 +98,7 @@ impl OpenVinoTranscriber {
                 config.model
             )));
         }
-        // `preprocessor_config.json` (mel-spectrogram feature-extraction
-        // params) isn't needed to construct the pipeline -- that only
-        // loads the .xml/.bin graphs -- but OpenVINO GenAI's WhisperPipeline
-        // reads it internally on the *first real transcription call*, so
-        // its absence doesn't surface until then, as an opaque "unknown
-        // exception" with no indication of why. Caught directly here
-        // instead, before that confusing failure mode, since it's a common
-        // gap for models fetched by an older `voxtype setup model download`
-        // (see that command's file list) rather than a fresh HF snapshot.
-        let preprocessor_config = model_dir.join("preprocessor_config.json");
-        if !preprocessor_config.exists() {
-            return Err(TranscribeError::ModelNotFound(format!(
-                "OpenVINO Whisper model at {} is missing preprocessor_config.json \
-                 (the mel-spectrogram feature-extraction config) -- present in the model's \
-                 own HuggingFace repo, but not fetched by older versions of 'voxtype setup \
-                 model download'. Without it, transcription fails on the *first* real call \
-                 with an opaque \"unknown exception\", not at startup.\n  \
-                 Fix: re-run 'voxtype setup model download {}', or fetch it directly:\n  \
-                 curl -Lo {} https://huggingface.co/OpenVINO/whisper-{}/resolve/main/preprocessor_config.json",
-                model_dir.display(),
-                config.model,
-                preprocessor_config.display(),
-                config.model,
-            )));
-        }
+        Self::require_preprocessor_config(&model_dir, &config.model)?;
         if config.threads.is_some() {
             tracing::warn!(
                 "OpenVINO GenAI WhisperPipeline does not support thread count configuration; \
@@ -208,15 +217,7 @@ impl OpenVinoTranscriber {
         // likely to still run acceptably on GPU than fall back all the
         // way to CPU. Skips a device already tried (e.g. configured
         // device is already GPU or CPU) rather than retrying it.
-        let mut candidates = vec![config.device.as_str()];
-        for device in ["GPU", "CPU"] {
-            if !candidates
-                .iter()
-                .any(|d| d.eq_ignore_ascii_case(device))
-            {
-                candidates.push(device);
-            }
-        }
+        let candidates = device_candidates(&config.device);
 
         let mut pipeline = None;
         let mut first_error: Option<(String, openvino_genai::SetupError)> = None;
@@ -231,7 +232,10 @@ impl OpenVinoTranscriber {
                              usually means something more fundamental (missing driver, \
                              unsupported op, no NPU on this chip).",
                             candidates[0],
-                            first_error.as_ref().map(|(_, e)| e.to_string()).unwrap_or_default(),
+                            first_error
+                                .as_ref()
+                                .map(|(_, e)| e.to_string())
+                                .unwrap_or_default(),
                             device,
                             candidates[0],
                         );
@@ -589,6 +593,33 @@ fn resolve_model_path(model: &str, quantized: bool) -> Result<PathBuf, Transcrib
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_fallback_order_prefers_gpu_before_cpu() {
+        assert_eq!(device_candidates("NPU"), ["NPU", "GPU", "CPU"]);
+        assert_eq!(device_candidates("AUTO"), ["AUTO", "GPU", "CPU"]);
+        assert_eq!(device_candidates("GPU"), ["GPU", "CPU"]);
+        assert_eq!(device_candidates("gpu"), ["gpu", "CPU"]);
+        assert_eq!(device_candidates("CPU"), ["CPU", "GPU"]);
+    }
+
+    #[test]
+    fn incomplete_model_fails_before_openvino_first_inference() {
+        let temp = tempfile::tempdir().expect("create temporary model directory");
+
+        let error = OpenVinoTranscriber::require_preprocessor_config(temp.path(), "medium-int4")
+            .expect_err("missing preprocessor config must fail before pipeline use")
+            .to_string();
+        assert!(error.contains("preprocessor_config.json"));
+        assert!(error.contains("first transcription"));
+        assert!(error.contains("unknown exception"));
+        assert!(error.contains("voxtype setup --download --model medium-int4"));
+
+        std::fs::write(temp.path().join("preprocessor_config.json"), b"{}")
+            .expect("create preprocessor config fixture");
+        OpenVinoTranscriber::require_preprocessor_config(temp.path(), "medium-int4")
+            .expect("complete model should pass preprocessor validation");
+    }
 
     #[test]
     fn test_resolve_model_path_absolute() {

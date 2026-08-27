@@ -325,12 +325,12 @@ curl -L -o ~/.local/share/voxtype/models/ggml-base.en.bin \
 
 **Cause:** The model directory is missing `preprocessor_config.json` (mel-spectrogram feature-extraction parameters). This file isn't needed to *load* the model — only the `.xml`/`.bin` graph files are — so the daemon starts and logs "Model loaded, ready for voice input" with no complaint. OpenVINO GenAI's `WhisperPipeline` only reads it on the *first real transcription call*, where its absence surfaces as an opaque `unknown exception` instead of a clear error.
 
-Models downloaded via `voxtype setup model download <name>` before this was fixed are missing it (the file list didn't include it). As of this fix, `voxtype` checks for this file at startup and fails with a clear message and fix command rather than letting it reach this confusing runtime error — if you're hitting this, you're likely on an older binary, or the model was fetched some other way.
+Models downloaded by older Voxtype versions may be missing it because the downloader's file list did not include it. Current builds check for this file at startup and fail with a clear message and fix command rather than letting the model reach this confusing runtime error.
 
 **Solution:**
 ```bash
 # Re-download the model (fetches the missing file along with everything else)
-voxtype setup model download <model-name>
+voxtype setup --download --model <model-name>
 
 # Or fetch just the missing file directly (note: NOT identical across model
 # sizes -- large-v3/large-v3-turbo use 128 mel bins, everything else uses 80,
