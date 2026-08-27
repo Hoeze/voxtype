@@ -3398,6 +3398,27 @@ const OPENVINO_MODEL_FILES: &[&str] = &[
     "preprocessor_config.json",
 ];
 
+/// Files required for an OpenVINO Whisper model to be usable at inference time.
+const OPENVINO_REQUIRED_MODEL_FILES: &[&str] = &[
+    "openvino_encoder_model.xml",
+    "openvino_encoder_model.bin",
+    "openvino_decoder_model.xml",
+    "openvino_decoder_model.bin",
+    "tokenizer.json",
+    "preprocessor_config.json",
+];
+
+fn openvino_download_command(file_path: &std::path::Path, url: &str) -> Command {
+    let mut command = Command::new("curl");
+    command
+        .arg("-fL")
+        .arg("--progress-bar")
+        .arg("-o")
+        .arg(file_path)
+        .arg(url);
+    command
+}
+
 const OPENVINO_MODELS: &[OpenVinoModelInfo] = &[
     // --- Tiny models ---
     OpenVinoModelInfo {
@@ -3710,21 +3731,7 @@ pub fn download_openvino_model(model_name: &str) -> anyhow::Result<()> {
 
         println!("  Downloading {}...", filename);
 
-        let status = Command::new("curl")
-            .args([
-                "-L",
-                "-f", // treat HTTP error responses (404, ...) as a failure --
-                      // without this, curl "successfully" saves the error
-                      // page's body as the model file instead of erroring,
-                      // which is exactly how a file silently missing from
-                      // this list (see preprocessor_config.json above)
-                      // could go unnoticed instead of failing the download.
-                "--progress-bar",
-                "-o",
-                file_path.to_str().unwrap_or("file"),
-                &url,
-            ])
-            .status();
+        let status = openvino_download_command(&file_path, &url).status();
 
         match status {
             Ok(exit_status) if exit_status.success() => {}
@@ -3777,19 +3784,7 @@ pub fn openvino_dir_name(name: &str) -> Option<&'static str> {
 
 /// Validate that an OpenVINO model directory has required files
 pub fn validate_openvino_model(path: &std::path::Path) -> anyhow::Result<()> {
-    let required = [
-        "openvino_encoder_model.xml",
-        "openvino_encoder_model.bin",
-        "openvino_decoder_model.xml",
-        "openvino_decoder_model.bin",
-        "tokenizer.json",
-        // Not needed to construct the pipeline, but its absence isn't
-        // caught until the first real transcription call otherwise --
-        // see OPENVINO_MODEL_FILES's comment and
-        // OpenVinoTranscriber::new's preprocessor_config check.
-        "preprocessor_config.json",
-    ];
-    for file in &required {
+    for file in OPENVINO_REQUIRED_MODEL_FILES {
         if !path.join(file).exists() {
             anyhow::bail!("Missing required file: {}", file);
         }
@@ -3891,6 +3886,61 @@ fn update_openvino_in_config(config: &str, model_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openvino_download_manifest_covers_every_required_runtime_file() {
+        for required in OPENVINO_REQUIRED_MODEL_FILES {
+            assert!(
+                OPENVINO_MODEL_FILES.contains(required),
+                "OpenVINO downloader is missing runtime-required file: {required}"
+            );
+        }
+        assert!(
+            OPENVINO_MODEL_FILES.contains(&"preprocessor_config.json"),
+            "preprocessor_config.json is read lazily by OpenVINO on first inference"
+        );
+    }
+
+    #[test]
+    fn openvino_downloads_fail_on_http_errors() {
+        let command = openvino_download_command(
+            std::path::Path::new("/tmp/openvino-model-file"),
+            "https://example.invalid/model-file",
+        );
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            args.iter()
+                .any(|arg| arg.starts_with('-') && arg[1..].contains('f')),
+            "curl must fail on HTTP errors instead of saving an error page: {args:?}"
+        );
+    }
+
+    #[test]
+    fn openvino_model_validation_requires_preprocessor_config() {
+        let temp = tempfile::tempdir().expect("create temporary model directory");
+        for required in OPENVINO_REQUIRED_MODEL_FILES {
+            if *required != "preprocessor_config.json" {
+                std::fs::write(temp.path().join(required), b"fixture")
+                    .expect("create required model fixture");
+            }
+        }
+
+        let error = validate_openvino_model(temp.path())
+            .expect_err("model without preprocessor_config.json must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "Missing required file: preprocessor_config.json"
+        );
+
+        std::fs::write(temp.path().join("preprocessor_config.json"), b"{}")
+            .expect("create preprocessor config fixture");
+        validate_openvino_model(temp.path())
+            .expect("model should validate once preprocessor_config.json exists");
+    }
 
     #[test]
     fn test_update_model_in_config_basic() {
