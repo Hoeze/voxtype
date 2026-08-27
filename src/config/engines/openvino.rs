@@ -42,40 +42,39 @@ pub struct OpenVinoConfig {
     #[serde(default)]
     pub openvino_dir: Option<String>,
 
-    // --- Sliding-window streaming settings (same knobs as [whisper]) ---
+    // --- Sliding-window streaming settings ---
     /// Enable live streaming transcription via the shared sliding-window engine.
     #[serde(default)]
     pub streaming: bool,
 
-    /// Seconds between re-transcriptions of the rolling buffer.
+    /// DEPRECATED: these `streaming_*` tuning fields used to be OpenVINO's
+    /// own copy of the sliding-window knobs (identical to `[whisper]`'s).
+    /// They're kept only as a fallback for old configs — set them via the
+    /// shared `[streaming]` section instead. See `StreamingConfig::resolve`.
     #[serde(default = "default_streaming_interval_secs")]
     pub streaming_interval_secs: f32,
 
-    /// Maximum buffered audio (seconds) before the window slides.
+    /// DEPRECATED, see `streaming_interval_secs`.
     #[serde(default = "default_streaming_max_buffer_secs")]
     pub streaming_max_buffer_secs: f32,
 
-    /// Skip transcription while whole-buffer RMS is below this.
+    /// DEPRECATED, see `streaming_interval_secs`.
     #[serde(default = "default_streaming_min_speech_rms")]
     pub streaming_min_speech_rms: f32,
 
-    /// Minimum buffered audio (seconds) before the first partial is attempted.
+    /// DEPRECATED, see `streaming_interval_secs`.
     #[serde(default = "default_streaming_min_audio_secs")]
     pub streaming_min_audio_secs: f32,
 
-    /// Minimum number of new stable words before a delta is committed/typed.
+    /// DEPRECATED, see `streaming_interval_secs`.
     #[serde(default = "default_streaming_partial_min_words")]
     pub streaming_partial_min_words: usize,
 
-    /// Type committed deltas live at the cursor (`true`) or commit whole
-    /// segments at once (`false`).
+    /// DEPRECATED, see `streaming_interval_secs`.
     #[serde(default = "default_streaming_type_partials")]
     pub streaming_type_partials: bool,
 
-    /// Experimental: type the current best-guess tail immediately and
-    /// correct it later via backspace + retype if a later tick disagrees,
-    /// instead of withholding it until two consecutive ticks agree. See
-    /// `transcribe::sliding_window`'s "Revision mode" doc section.
+    /// DEPRECATED, see `streaming_interval_secs`.
     #[serde(default)]
     pub streaming_revision_mode: bool,
 }

@@ -1,8 +1,8 @@
 use super::{
     AudioConfig, CohereConfig, DolphinConfig, HotkeyConfig, MeetingConfig, MoonshineConfig,
     OmnilingualConfig, OpenVinoConfig, OutputConfig, ParaformerConfig, ParakeetConfig, Profile,
-    SenseVoiceConfig, SonioxConfig, StatusConfig, TextConfig, TranscriptionEngine, VadConfig,
-    WhisperConfig,
+    SenseVoiceConfig, SonioxConfig, StatusConfig, StreamingConfig, TextConfig, TranscriptionEngine,
+    VadConfig, WhisperConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -66,6 +66,14 @@ pub struct Config {
     #[serde(default)]
     pub soniox: Option<SonioxConfig>,
 
+    /// Shared sliding-window streaming engine tuning, used by every batch
+    /// backend wrapped in `transcribe::sliding_window` (currently `whisper`
+    /// and `openvino`). `None` when config.toml has no `[streaming]`
+    /// section, in which case each engine falls back to its own deprecated
+    /// `streaming_*` fields — see `StreamingConfig::resolve`.
+    #[serde(default)]
+    pub streaming: Option<StreamingConfig>,
+
     /// Text processing configuration (replacements, spoken punctuation)
     #[serde(default)]
     pub text: TextConfig,
@@ -119,6 +127,7 @@ impl Default for Config {
             cohere: None,
             openvino: None,
             soniox: None,
+            streaming: None,
             text: TextConfig::default(),
             vad: VadConfig::default(),
             status: StatusConfig::default(),
@@ -140,6 +149,12 @@ impl Config {
     /// editing the daemon.
     pub fn streaming_active(&self) -> bool {
         match self.engine {
+            // Same sliding-window engine and the same libinput held-key
+            // hazard as OpenVino below — this arm was missing until now,
+            // which meant push-to-talk users with `[whisper] streaming =
+            // true` never got auto-promoted to toggle mode and could hit
+            // the exact stuck-recording bug this gate exists to prevent.
+            TranscriptionEngine::Whisper => self.whisper.streaming,
             TranscriptionEngine::Parakeet => {
                 self.parakeet.as_ref().map(|p| p.streaming).unwrap_or(false)
             }
