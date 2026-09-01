@@ -334,10 +334,12 @@ required-features = ["cohere"]
 
 # TEMPORARY: openvino-genai 0.11.0's WhisperPipeline has no way to pass
 # device properties (CACHE_DIR etc.), unlike LlmPipeline/VlmPipeline in
-# the same crate which already expose with_properties(). Pinned to a fork
-# branch that adds the same method for Whisper, pending upstream review:
-# https://github.com/intel/openvino-rs/pull/196
+# the same crate which already expose with_properties(). Pinned to a
+# voxtype-org mirror of the fork branch that adds the same method for
+# Whisper (upstream review pending at
+# https://github.com/intel/openvino-rs/pull/196); mirrored so source
+# builds don't depend on an individual's fork staying available.
 # Drop this patch (and bump the openvino-genai version requirement above
 # if needed) once that PR merges and ships in a crates.io release.
 [patch.crates-io]
-openvino-genai = { git = "https://github.com/tslove923/openvino-rs", branch = "whisper-pipeline-with-properties" }
+openvino-genai = { git = "https://github.com/voxtype/openvino-rs", branch = "whisper-pipeline-with-properties" }
