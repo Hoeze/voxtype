@@ -1088,12 +1088,6 @@ impl Daemon {
         }
     }
 
-    /// Start a push-to-talk audio capture and (if enabled) a level emitter.
-    ///
-    /// Returns the capture handle on success. The chunk receiver from the
-    /// capture is plumbed into the level hub so the OSD sees audio frames
-    /// at 100 Hz during recording. The emitter task is tracked so it can
-    /// be cleanly aborted when recording stops.
     /// Build a `SpeechTracker` for silence-based auto-stop, if `armed` and
     /// the feature is configured. `armed` should be `true` only for
     /// external-trigger (wake-word) sessions — see the doc comment on

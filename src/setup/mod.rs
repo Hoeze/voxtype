@@ -652,35 +652,25 @@ pub async fn run_setup(
                         .unwrap_or(0.0);
                     print_success(&format!("Model ready: {} ({:.0} MB)", model_name, size));
                 }
-                // Update config to use OpenVINO
-                model::set_openvino_config(model_name)?;
-                if !quiet {
-                    print_success(&format!(
-                        "Config updated: engine = \"openvino\", model = \"{}\"",
-                        model_name
-                    ));
-                    let device = config
-                        .openvino
-                        .as_ref()
-                        .map(|openvino| openvino.device.as_str())
-                        .unwrap_or("NPU");
-                    model::print_openvino_installation_guidance(device);
+                if activate {
+                    model::set_openvino_config(model_name)?;
+                    if !quiet {
+                        print_success(&format!(
+                            "Config updated: engine = \"openvino\", model = \"{}\"",
+                            model_name
+                        ));
+                    }
                 }
             } else if download {
                 model::download_openvino_model(model_name)?;
-                // Update config to use OpenVINO
-                model::set_openvino_config(model_name)?;
-                if !quiet {
-                    print_success(&format!(
-                        "Config updated: engine = \"openvino\", model = \"{}\"",
-                        model_name
-                    ));
-                    let device = config
-                        .openvino
-                        .as_ref()
-                        .map(|openvino| openvino.device.as_str())
-                        .unwrap_or("NPU");
-                    model::print_openvino_installation_guidance(device);
+                if activate {
+                    model::set_openvino_config(model_name)?;
+                    if !quiet {
+                        print_success(&format!(
+                            "Config updated: engine = \"openvino\", model = \"{}\"",
+                            model_name
+                        ));
+                    }
                 }
             } else if !quiet {
                 print_info(&format!("Model '{}' not downloaded yet", model_name));
