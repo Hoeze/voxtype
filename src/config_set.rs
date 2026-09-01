@@ -100,6 +100,7 @@ pub const ENGINE_NAMES: &[&str] = &[
     "dolphin",
     "omnilingual",
     "cohere",
+    "openvino",
 ];
 
 /// Is the engine name one we recognize at all?

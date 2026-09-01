@@ -1256,6 +1256,7 @@ mod tests {
                     "whisper" => ModelKind::Whisper,
                     "parakeet" => ModelKind::Parakeet,
                     "sensevoice" => ModelKind::SenseVoice,
+                    "openvino" => ModelKind::OpenVino,
                     other => panic!(
                         "'{}' advertises a download argument but run_setup has no branch for it",
                         other
