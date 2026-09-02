@@ -169,7 +169,11 @@ pub fn enable() -> anyhow::Result<()> {
         // Download default model if needed
         if !has_openvino_model() {
             println!();
-            super::model::download_openvino_model(DEFAULT_OPENVINO_MODEL)?;
+            let loaded = crate::config::load_config(None).unwrap_or_default();
+            let mut openvino = loaded.openvino.unwrap_or_default();
+            openvino.device = "NPU".to_string();
+            openvino.model = DEFAULT_OPENVINO_MODEL.to_string();
+            super::model::download_openvino_model_with_config(DEFAULT_OPENVINO_MODEL, &openvino)?;
         } else {
             super::print_success(&format!(
                 "OpenVINO model '{}' already installed",

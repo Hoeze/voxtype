@@ -640,6 +640,14 @@ pub async fn run_setup(
                 model_path.exists() && model::validate_openvino_model(&model_path).is_ok();
 
             if model_valid {
+                // A failed first compile leaves valid downloaded IR files in
+                // place. A retry with --download must retry NPU preparation
+                // instead of treating those files alone as complete setup.
+                if download {
+                    let mut openvino = config.openvino.clone().unwrap_or_default();
+                    openvino.model = model_name.to_string();
+                    model::prepare_openvino_model_for_config(model_name, &openvino)?;
+                }
                 if !quiet {
                     let size = std::fs::read_dir(&model_path)
                         .map(|entries| {
@@ -662,7 +670,9 @@ pub async fn run_setup(
                     }
                 }
             } else if download {
-                model::download_openvino_model(model_name)?;
+                let mut openvino = config.openvino.clone().unwrap_or_default();
+                openvino.model = model_name.to_string();
+                model::download_openvino_model_with_config(model_name, &openvino)?;
                 if activate {
                     model::set_openvino_config(model_name)?;
                     if !quiet {

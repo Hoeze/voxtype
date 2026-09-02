@@ -3,7 +3,7 @@
 use super::manifest::{ExpectedFile, ModelArtifact};
 use super::progress::{self, FileProgress};
 use super::{print_failure, print_info, print_success, print_warning};
-use crate::config::{Config, TranscriptionEngine};
+use crate::config::{Config, OpenVinoConfig, TranscriptionEngine};
 use crate::transcribe::whisper::{get_model_filename, get_model_url};
 use std::io::{self, Write};
 use std::path::Path;
@@ -1826,7 +1826,7 @@ pub async fn interactive_select() -> anyhow::Result<()> {
         handle_cohere_selection(idx).await
     } else if openvino_available && selection <= openvino_offset + openvino_count {
         let idx = selection - openvino_offset;
-        handle_openvino_selection(idx).await
+        handle_openvino_selection(idx, &config).await
     } else {
         println!("\nInvalid selection.");
         Ok(())
@@ -3467,7 +3467,7 @@ fn validate_onnx_ctc_model(path: &Path) -> anyhow::Result<()> {
 }
 
 /// Handle OpenVINO model selection (download/config).
-async fn handle_openvino_selection(selection: usize) -> anyhow::Result<()> {
+async fn handle_openvino_selection(selection: usize, config: &Config) -> anyhow::Result<()> {
     let models_dir = Config::models_dir();
 
     if selection == 0 || selection > OPENVINO_MODELS.len() {
@@ -3490,6 +3490,9 @@ async fn handle_openvino_selection(selection: usize) -> anyhow::Result<()> {
         io::stdin().read_line(&mut choice)?;
         match choice.trim() {
             "" | "1" => {
+                let mut openvino = config.openvino.clone().unwrap_or_default();
+                openvino.model = model.name.to_string();
+                prepare_openvino_model_for_config(model.name, &openvino)?;
                 update_config_openvino(model.name)?;
                 restart_daemon_if_running().await;
                 return Ok(());
@@ -3502,7 +3505,9 @@ async fn handle_openvino_selection(selection: usize) -> anyhow::Result<()> {
         }
     }
 
-    download_openvino_model(model.name)?;
+    let mut openvino = config.openvino.clone().unwrap_or_default();
+    openvino.model = model.name.to_string();
+    download_openvino_model_with_config(model.name, &openvino)?;
     update_config_openvino(model.name)?;
     restart_daemon_if_running().await;
     Ok(())
@@ -4035,8 +4040,75 @@ const OPENVINO_MODELS: &[OpenVinoModelInfo] = &[
     },
 ];
 
-/// Download an OpenVINO Whisper model by name
+/// Download an OpenVINO Whisper model using the user's configured device.
+/// NPU downloads do not return until the compiled cache blob is ready.
 pub fn download_openvino_model(model_name: &str) -> anyhow::Result<()> {
+    let config = crate::config::load_config(None).unwrap_or_default();
+    let mut openvino = config.openvino.unwrap_or_default();
+    openvino.model = model_name.to_string();
+    download_openvino_model_with_config(model_name, &openvino)
+}
+
+/// Download an OpenVINO model and eagerly compile it when NPU is selected.
+pub fn download_openvino_model_with_config(
+    model_name: &str,
+    config: &OpenVinoConfig,
+) -> anyhow::Result<()> {
+    download_openvino_model_files(model_name)?;
+
+    if openvino_download_needs_precompile(&config.device) {
+        prepare_openvino_model_for_config(model_name, config)?;
+    } else {
+        print_success(&format!("OpenVINO model '{}' downloaded", model_name));
+    }
+
+    Ok(())
+}
+
+fn openvino_download_needs_precompile(device: &str) -> bool {
+    device.trim().eq_ignore_ascii_case("NPU")
+}
+
+/// Ensure setup has synchronously compiled an NPU model into OpenVINO's cache.
+/// This is also usable when retrying setup after a previous compile failed but
+/// left the fully downloaded IR files in place.
+pub fn prepare_openvino_model_for_config(
+    model_name: &str,
+    config: &OpenVinoConfig,
+) -> anyhow::Result<()> {
+    if !openvino_download_needs_precompile(&config.device) {
+        return Ok(());
+    }
+
+    #[cfg(not(feature = "openvino-whisper"))]
+    {
+        let _ = model_name;
+        anyhow::bail!("NPU cache compilation requires the 'openvino-whisper' feature");
+    }
+
+    #[cfg(feature = "openvino-whisper")]
+    {
+        println!(
+            "\nCompiling '{}' for Intel NPU and creating its cache blob...",
+            model_name
+        );
+        println!("  This can take several minutes for large models. Please wait.");
+        io::stdout().flush()?;
+
+        let mut compile_config = config.clone();
+        compile_config.model = model_name.to_string();
+        let cache_dir = crate::transcribe::openvino_whisper::precompile_npu_model(&compile_config)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        print_success(&format!(
+            "OpenVINO model '{}' compiled for NPU and cached in {}",
+            model_name,
+            cache_dir.display()
+        ));
+        Ok(())
+    }
+}
+
+fn download_openvino_model_files(model_name: &str) -> anyhow::Result<()> {
     let model = OPENVINO_MODELS
         .iter()
         .find(|m| m.name == model_name)
@@ -4099,8 +4171,8 @@ pub fn download_openvino_model(model_name: &str) -> anyhow::Result<()> {
         print_failure("Model download incomplete. Missing required files.");
     })?;
 
-    print_success(&format!(
-        "OpenVINO model '{}' downloaded to {:?}",
+    print_info(&format!(
+        "OpenVINO model '{}' download complete at {:?}",
         model.name, model_path
     ));
 
@@ -4229,6 +4301,15 @@ fn update_openvino_in_config(config: &str, model_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_npu_downloads_require_eager_openvino_compilation() {
+        assert!(openvino_download_needs_precompile("NPU"));
+        assert!(openvino_download_needs_precompile(" npu "));
+        assert!(!openvino_download_needs_precompile("GPU"));
+        assert!(!openvino_download_needs_precompile("CPU"));
+        assert!(!openvino_download_needs_precompile("AUTO"));
+    }
 
     #[test]
     fn openvino_download_manifest_covers_every_required_runtime_file() {

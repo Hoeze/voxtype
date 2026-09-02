@@ -12,7 +12,7 @@ use crate::config::OpenVinoConfig;
 use crate::error::TranscribeError;
 use openvino_genai::WhisperPipeline;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// Directory OpenVINO persists compiled device blobs to (`CACHE_DIR`
@@ -24,6 +24,79 @@ fn openvino_cache_dir() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
         .join("voxtype")
         .join("openvino")
+}
+
+/// Compile one downloaded model specifically for the NPU and wait until
+/// OpenVINO has persisted its compiled blob.
+///
+/// Setup deliberately uses a strict NPU initialization here. The normal
+/// transcription path falls back to GPU and CPU when an accelerator is not
+/// available, but that would let `voxtype setup model` claim that NPU setup
+/// succeeded without ever producing an NPU cache entry.
+pub fn precompile_npu_model(config: &OpenVinoConfig) -> Result<PathBuf, TranscribeError> {
+    let model_dir = resolve_model_path(&config.model, config.quantized)?;
+    let encoder_xml = model_dir.join("openvino_encoder_model.xml");
+    if !encoder_xml.exists() {
+        return Err(TranscribeError::ModelNotFound(format!(
+            "OpenVINO Whisper encoder model not found: {}",
+            encoder_xml.display()
+        )));
+    }
+    OpenVinoTranscriber::require_preprocessor_config(&model_dir, &config.model)?;
+
+    OpenVinoTranscriber::load_library(config)?;
+    let model_path_str = model_dir.to_str().ok_or_else(|| {
+        TranscribeError::InitFailed("Model path contains invalid UTF-8".to_string())
+    })?;
+
+    let cache_dir = openvino_cache_dir();
+    fs::create_dir_all(&cache_dir).map_err(|error| {
+        TranscribeError::InitFailed(format!(
+            "Failed to create OpenVINO cache directory {}: {}",
+            cache_dir.display(),
+            error
+        ))
+    })?;
+    let cache_dir_str = cache_dir.to_string_lossy();
+    let props: &[(&str, &str)] = &[("CACHE_DIR", &cache_dir_str)];
+
+    // WhisperPipeline construction is synchronous: it returns only after the
+    // NPU compiler has finished (or failed) and CACHE_DIR has been serviced.
+    let _pipeline =
+        WhisperPipeline::with_properties(model_path_str, "NPU", props).map_err(|error| {
+            TranscribeError::InitFailed(format!(
+                "Failed to compile OpenVINO Whisper model '{}' for NPU: {}\n\n{}",
+                config.model,
+                error,
+                config.installation_guidance(),
+            ))
+        })?;
+
+    if !contains_compiled_blob(&cache_dir) {
+        return Err(TranscribeError::InitFailed(format!(
+            "OpenVINO finished compiling '{}' for NPU but did not create a cache blob in {}",
+            config.model,
+            cache_dir.display()
+        )));
+    }
+
+    Ok(cache_dir)
+}
+
+fn contains_compiled_blob(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            contains_compiled_blob(&path)
+        } else {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("blob"))
+        }
+    })
 }
 
 /// OpenVINO GenAI Whisper transcriber for Intel NPU/CPU/GPU.
@@ -601,6 +674,17 @@ mod tests {
         assert_eq!(device_candidates("GPU"), ["GPU", "CPU"]);
         assert_eq!(device_candidates("gpu"), ["gpu", "CPU"]);
         assert_eq!(device_candidates("CPU"), ["CPU", "GPU"]);
+    }
+
+    #[test]
+    fn compiled_blob_detection_checks_nested_cache_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let nested = temp.path().join("NPU").join("model");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(!contains_compiled_blob(temp.path()));
+
+        std::fs::write(nested.join("compiled.BLOB"), b"cache").unwrap();
+        assert!(contains_compiled_blob(temp.path()));
     }
 
     #[test]
