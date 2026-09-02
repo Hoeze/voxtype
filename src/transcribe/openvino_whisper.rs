@@ -18,12 +18,100 @@ use std::sync::Mutex;
 /// Directory OpenVINO persists compiled device blobs to (`CACHE_DIR`
 /// property), so NPU/GPU graph compilation isn't repeated on every pipeline
 /// init. Same `$XDG_CACHE_HOME/voxtype/<name>` convention as the MIGraphX
-/// model cache in `setup/binary.rs`.
+/// model cache in `setup/binary.rs`. Each model gets its own subdirectory
+/// under this — see `scoped_model_cache_dir`.
 fn openvino_cache_dir() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("voxtype")
         .join("openvino")
+}
+
+/// Per-model cache subdirectory: `<base>/<model dir name>/`. Scoping the
+/// cache per model lets setup answer "is *this* model compiled?" — a shared
+/// flat directory can only answer "was anything ever compiled?".
+fn scoped_model_cache_dir(base: &Path, model_dir: &Path) -> PathBuf {
+    match model_dir.file_name() {
+        Some(name) => base.join(name),
+        None => base.to_path_buf(),
+    }
+}
+
+/// Whether this model already has a compiled device blob in its per-model
+/// cache directory. Lets setup skip the NPU compile when there is nothing
+/// left to do.
+pub fn has_compiled_blob(config: &OpenVinoConfig) -> bool {
+    resolve_model_path(&config.model, config.quantized)
+        .map(|model_dir| {
+            contains_compiled_blob(&scoped_model_cache_dir(&openvino_cache_dir(), &model_dir))
+        })
+        .unwrap_or(false)
+}
+
+/// Model-directory checks shared by transcriber construction and the
+/// setup-time NPU compile.
+fn require_model_files(model_dir: &Path, model_name: &str) -> Result<(), TranscribeError> {
+    let encoder_xml = model_dir.join("openvino_encoder_model.xml");
+    if !encoder_xml.exists() {
+        return Err(TranscribeError::ModelNotFound(format!(
+            "OpenVINO Whisper encoder model not found: {}\n  \
+             Run 'voxtype setup model' to download, or manually from:\n  \
+             https://huggingface.co/OpenVINO/whisper-{}",
+            encoder_xml.display(),
+            model_name
+        )));
+    }
+    OpenVinoTranscriber::require_preprocessor_config(model_dir, model_name)
+}
+
+/// The validated inputs every WhisperPipeline construction needs regardless
+/// of device: model files present, GenAI library loaded, per-model cache
+/// directory created. Built once, then `build()` compiles for one explicit
+/// device. The runtime fallback chain and the setup-time NPU compile both go
+/// through this so the two sequences can't diverge.
+struct PipelineInputs {
+    model_path: String,
+    cache_dir: PathBuf,
+}
+
+impl PipelineInputs {
+    fn new(model_dir: &Path, config: &OpenVinoConfig) -> Result<Self, TranscribeError> {
+        require_model_files(model_dir, &config.model)?;
+        OpenVinoTranscriber::load_library(config)?;
+
+        let model_path = model_dir
+            .to_str()
+            .ok_or_else(|| {
+                TranscribeError::InitFailed("Model path contains invalid UTF-8".to_string())
+            })?
+            .to_string();
+
+        // CACHE_DIR persists the device's compiled model blob to disk so
+        // subsequent pipeline inits skip recompilation. This matters most
+        // on NPU (compiling the graph to NPU-ISA) and GPU (OpenCL kernel
+        // compilation) — both are expensive on cold start and otherwise pay
+        // that cost on every daemon restart. CPU accepts the property too
+        // but has little to gain from it (its compile step is cheap).
+        let cache_dir = scoped_model_cache_dir(&openvino_cache_dir(), model_dir);
+        fs::create_dir_all(&cache_dir).map_err(|error| {
+            TranscribeError::InitFailed(format!(
+                "Failed to create OpenVINO cache directory {}: {}",
+                cache_dir.display(),
+                error
+            ))
+        })?;
+
+        Ok(Self {
+            model_path,
+            cache_dir,
+        })
+    }
+
+    fn build(&self, device: &str) -> Result<WhisperPipeline, openvino_genai::SetupError> {
+        let cache_dir_str = self.cache_dir.to_string_lossy();
+        let props: &[(&str, &str)] = &[("CACHE_DIR", &cache_dir_str)];
+        WhisperPipeline::with_properties(&self.model_path, device, props)
+    }
 }
 
 /// Compile one downloaded model specifically for the NPU and wait until
@@ -35,52 +123,28 @@ fn openvino_cache_dir() -> PathBuf {
 /// succeeded without ever producing an NPU cache entry.
 pub fn precompile_npu_model(config: &OpenVinoConfig) -> Result<PathBuf, TranscribeError> {
     let model_dir = resolve_model_path(&config.model, config.quantized)?;
-    let encoder_xml = model_dir.join("openvino_encoder_model.xml");
-    if !encoder_xml.exists() {
-        return Err(TranscribeError::ModelNotFound(format!(
-            "OpenVINO Whisper encoder model not found: {}",
-            encoder_xml.display()
-        )));
-    }
-    OpenVinoTranscriber::require_preprocessor_config(&model_dir, &config.model)?;
-
-    OpenVinoTranscriber::load_library(config)?;
-    let model_path_str = model_dir.to_str().ok_or_else(|| {
-        TranscribeError::InitFailed("Model path contains invalid UTF-8".to_string())
-    })?;
-
-    let cache_dir = openvino_cache_dir();
-    fs::create_dir_all(&cache_dir).map_err(|error| {
-        TranscribeError::InitFailed(format!(
-            "Failed to create OpenVINO cache directory {}: {}",
-            cache_dir.display(),
-            error
-        ))
-    })?;
-    let cache_dir_str = cache_dir.to_string_lossy();
-    let props: &[(&str, &str)] = &[("CACHE_DIR", &cache_dir_str)];
+    let inputs = PipelineInputs::new(&model_dir, config)?;
 
     // WhisperPipeline construction is synchronous: it returns only after the
     // NPU compiler has finished (or failed) and CACHE_DIR has been serviced.
-    let _pipeline =
-        WhisperPipeline::with_properties(model_path_str, "NPU", props).map_err(|error| {
-            TranscribeError::InitFailed(format!(
-                "Failed to compile OpenVINO Whisper model '{}' for NPU: {}\n\n{}",
-                config.model,
-                error,
-                config.installation_guidance(),
-            ))
-        })?;
+    let _pipeline = inputs.build("NPU").map_err(|error| {
+        TranscribeError::InitFailed(format!(
+            "Failed to compile OpenVINO Whisper model '{}' for NPU: {}\n\n{}",
+            config.model,
+            error,
+            config.installation_guidance(),
+        ))
+    })?;
 
-    if !contains_compiled_blob(&cache_dir) {
+    if !contains_compiled_blob(&inputs.cache_dir) {
         return Err(TranscribeError::InitFailed(format!(
             "OpenVINO finished compiling '{}' for NPU but did not create a cache blob in {}",
             config.model,
-            cache_dir.display()
+            inputs.cache_dir.display()
         )));
     }
 
-    Ok(cache_dir)
+    Ok(inputs.cache_dir)
 }
 
 fn contains_compiled_blob(dir: &Path) -> bool {
@@ -161,17 +225,7 @@ impl OpenVinoTranscriber {
         );
 
         // Sanity check that the model directory has expected files
-        let encoder_xml = model_dir.join("openvino_encoder_model.xml");
-        if !encoder_xml.exists() {
-            return Err(TranscribeError::ModelNotFound(format!(
-                "OpenVINO Whisper encoder model not found: {}\n  \
-                 Run 'voxtype setup model' to download, or manually from:\n  \
-                 https://huggingface.co/OpenVINO/whisper-{}",
-                encoder_xml.display(),
-                config.model
-            )));
-        }
-        Self::require_preprocessor_config(&model_dir, &config.model)?;
+        require_model_files(&model_dir, &config.model)?;
         if config.threads.is_some() {
             tracing::warn!(
                 "OpenVINO GenAI WhisperPipeline does not support thread count configuration; \
@@ -243,21 +297,7 @@ impl OpenVinoTranscriber {
     ) -> Result<WhisperPipeline, TranscribeError> {
         let start = std::time::Instant::now();
 
-        Self::load_library(config)?;
-
-        let model_path_str = model_dir.to_str().ok_or_else(|| {
-            TranscribeError::InitFailed("Model path contains invalid UTF-8".to_string())
-        })?;
-
-        // CACHE_DIR persists the device's compiled model blob to disk so
-        // subsequent pipeline inits skip recompilation. This matters most
-        // on NPU (compiling the graph to NPU-ISA) and GPU (OpenCL kernel
-        // compilation) — both are expensive on cold start and otherwise pay
-        // that cost on every daemon restart. CPU accepts the property too
-        // but has little to gain from it (its compile step is cheap).
-        let cache_dir = openvino_cache_dir();
-        let cache_dir_str = cache_dir.to_string_lossy();
-        let props: &[(&str, &str)] = &[("CACHE_DIR", &cache_dir_str)];
+        let inputs = PipelineInputs::new(model_dir, config)?;
 
         // NPU compiling a large model for the first time is *slow*, not
         // broken -- confirmed live: large-v3-int4's first NPU compile on
@@ -277,7 +317,7 @@ impl OpenVinoTranscriber {
                  model (confirmed: large-v3-int4 ~15min on one machine) -- this is normal, \
                  not a hang, and only happens once per model (cached afterward at {:?})",
                 config.device,
-                cache_dir,
+                inputs.cache_dir,
             );
         }
 
@@ -295,7 +335,7 @@ impl OpenVinoTranscriber {
         let mut pipeline = None;
         let mut first_error: Option<(String, openvino_genai::SetupError)> = None;
         for (i, device) in candidates.iter().enumerate() {
-            match WhisperPipeline::with_properties(model_path_str, device, props) {
+            match inputs.build(device) {
                 Ok(p) => {
                     if i > 0 {
                         tracing::warn!(
@@ -685,6 +725,27 @@ mod tests {
 
         std::fs::write(nested.join("compiled.BLOB"), b"cache").unwrap();
         assert!(contains_compiled_blob(temp.path()));
+    }
+
+    #[test]
+    fn compiled_blob_check_is_scoped_per_model() {
+        let base = tempfile::tempdir().unwrap();
+        let model_a = scoped_model_cache_dir(
+            base.path(),
+            Path::new("/models/openvino-whisper-tiny-int4-ov"),
+        );
+        let model_b = scoped_model_cache_dir(
+            base.path(),
+            Path::new("/models/openvino-whisper-base.en-int8-ov"),
+        );
+        assert_ne!(model_a, model_b);
+
+        std::fs::create_dir_all(&model_a).unwrap();
+        std::fs::write(model_a.join("compiled.blob"), b"cache").unwrap();
+
+        // A blob compiled for model A must not satisfy model B's check.
+        assert!(contains_compiled_blob(&model_a));
+        assert!(!contains_compiled_blob(&model_b));
     }
 
     #[test]
