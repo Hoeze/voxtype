@@ -640,14 +640,6 @@ pub async fn run_setup(
                 model_path.exists() && model::validate_openvino_model(&model_path).is_ok();
 
             if model_valid {
-                // A failed first compile leaves valid downloaded IR files in
-                // place. A retry with --download must retry NPU preparation
-                // instead of treating those files alone as complete setup.
-                if download {
-                    let mut openvino = config.openvino.clone().unwrap_or_default();
-                    openvino.model = model_name.to_string();
-                    model::prepare_openvino_model_for_config(model_name, &openvino)?;
-                }
                 if !quiet {
                     let size = std::fs::read_dir(&model_path)
                         .map(|entries| {
@@ -669,10 +661,15 @@ pub async fn run_setup(
                         ));
                     }
                 }
+                // A failed first compile leaves valid downloaded IR files in
+                // place, so a --download retry (or activating the model) must
+                // still get a chance at NPU preparation. The compile is
+                // skipped when this model's cache blob already exists.
+                if download || activate {
+                    model::prepare_openvino_model(model_name, config);
+                }
             } else if download {
-                let mut openvino = config.openvino.clone().unwrap_or_default();
-                openvino.model = model_name.to_string();
-                model::download_openvino_model_with_config(model_name, &openvino)?;
+                model::download_openvino_model(model_name)?;
                 if activate {
                     model::set_openvino_config(model_name)?;
                     if !quiet {
@@ -682,6 +679,7 @@ pub async fn run_setup(
                         ));
                     }
                 }
+                model::prepare_openvino_model(model_name, config);
             } else if !quiet {
                 print_info(&format!("Model '{}' not downloaded yet", model_name));
                 println!(
